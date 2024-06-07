@@ -39,11 +39,13 @@ namespace fastllm {
         locker.unlock();
     }
 
-    void ResponseContext::Init(int blocks) {
+    void ResponseContext::Init(int blocks, DataType dataType) {
         pastKeyValues.clear();
         for (int i = 0; i < blocks; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(dataType),
+                                                   Data(dataType)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
         intParams.clear();
         currentTokens.clear();
@@ -53,9 +55,108 @@ namespace fastllm {
         isEnding = false;
         preTokens = 0;
     }
+
+    PastKVCacheMemory::PastKVCacheMemory(const std::string &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
+        this->prompt = prompt;
+        this->tokens = tokens;
+        this->flushTime = flushTime;
+        this->recordTimes = 1;
+        auto dataType = (*kv)[0].first.dataType;
+        for (int i = 0; i < kv->size(); i++) {
+            this->kv.push_back(std::make_pair(Data(dataType), Data(dataType)));
+        }
+        for (int i = 0; i < kv->size(); i++) {
+            (*kv)[i].first.ToDevice(DataDevice::CPU);
+            (*kv)[i].second.ToDevice(DataDevice::CPU);
+
+            this->kv[i].first.CopyFrom((*kv)[i].first);
+            this->kv[i].second.CopyFrom((*kv)[i].second);
+        }
+    }
+
+    void PastKVCacheManager::SetMaxRecordNum(int maxRecordNum) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        this->maxRecordNum = maxRecordNum;
+    }
+
+    void PastKVCacheManager::Record(const std::string &prompt, int tokens, std::vector<std::pair<Data, Data> > *kv) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        if (this->memorys.find(prompt) != this->memorys.end()) {
+            this->memorys[prompt]->recordTimes++;
+            this->memorys[prompt]->flushTime = ++flushTime;
+            return;
+        }
+
+        if (this->memorys.size() >= this->maxRecordNum) {
+            std::string prompt = "";
+            long long minFlushTime = (1LL << 60);
+            for (auto &it : this->memorys) {
+                if (it.second->flushTime < minFlushTime) {
+                    minFlushTime = it.second->flushTime;
+                    prompt = it.first;
+                }
+            }
+            delete this->memorys[prompt];
+            this->memorys.erase(this->memorys.find(prompt));
+        }
+
+        this->memorys[prompt] = new PastKVCacheMemory(prompt, tokens, ++flushTime, kv);
+    }
+
+    void PastKVCacheManager::Remove(std::string prompt) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        if (this->memorys.find(prompt) != this->memorys.end()) {
+            if ((--this->memorys[prompt]->recordTimes) <= 0) {
+                delete this->memorys[prompt];
+                this->memorys.erase(this->memorys.find(prompt));
+            }
+        }
+    }
+
+    PastKVCacheMemory *PastKVCacheManager::Get(const std::string &prompt) {
+        locker.lock();
+        std::string maxPrompt = "";
+        for (auto &it : this->memorys) {
+            const std::string &cur = it.first;
+            if (cur.size() > maxPrompt.size() && cur.size() <= prompt.size() && prompt.substr(0, cur.size()) == cur) {
+                maxPrompt = cur;
+            }
+        }
+        if (maxPrompt == "") {
+            return nullptr;
+        }
+        this->memorys[maxPrompt]->flushTime = ++this->flushTime;
+        return this->memorys[maxPrompt];
+    }
+
+    void PastKVCacheManager::Unlock() {
+        locker.unlock();
+    }
     
-    std::string basellm::Response(const std::string &input, RuntimeResult retCb,
+    std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
+        std::string input = oriInput;
+        if (this->saveHistoryChat) {
+            if (lastKeyValues != nullptr) {
+                if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
+                    lastPrompt = "";
+                    lastPromptTokens = 0;
+                    delete lastKeyValues;
+                    lastKeyValues = nullptr;
+                } else {
+                    input = input.substr(lastPrompt.size());
+                }
+            }
+        } else {
+            lastPrompt = "";
+            lastPromptTokens = 0;
+            delete lastKeyValues;
+            lastKeyValues = nullptr;
+        }
+
+        //printf("lastPrompt = %s\n", lastPrompt.c_str());
+        //printf("input = %s\n", input.c_str());
+
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
@@ -73,22 +174,32 @@ namespace fastllm {
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
-        std::vector<std::pair<Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+        
+        if (lastKeyValues == nullptr) {
+            lastKeyValues = new std::vector<std::pair<Data, Data> >();
+            for (int i = 0; i < block_cnt; i++) {
+                lastKeyValues->push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+                lastKeyValues->back().first.SetKVCache();
+                lastKeyValues->back().second.SetKVCache();
+            }
         }
 
+        std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
         std::string retString = "";
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
-        int promptLen = inputTokens[0].size(), index = 0;
-        FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
+        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
+        int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
+        FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
+                      inputIds, attentionMask, positionIds);
+        ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
             tokens.units[0].Push(ret);
-            if (ret == eos_token_id) {
+            if (ret == eos_token_id
+                || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()
+                || eos_token_ids.find(ret) != eos_token_ids.end()) {
                 break;
             }
 
@@ -115,7 +226,9 @@ namespace fastllm {
             results.clear();
 
             inputTokens[0] = std::vector<float> {(float)ret};
-            FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
+            FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
+                          inputIds, attentionMask, positionIds);
+            ToDataType(attentionMask, this->dataType);
             if (index == generationConfig.output_token_limit) {
                 break;
             }
@@ -135,6 +248,9 @@ namespace fastllm {
 #else
             retCb(-1, retString.c_str());
 #endif
+
+        lastPrompt += (input + retString);
+        lastPromptTokens = promptLen + index;
         return retString;
     }
 
@@ -176,8 +292,10 @@ namespace fastllm {
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(dataType),
+                                                   Data(dataType)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
 
         std::vector <std::map <std::string, int> > params;
@@ -187,14 +305,18 @@ namespace fastllm {
         }
         params[0]["index"] = 0;
         int index = 0;
+        params[0]["add_special_tokens"] = generationConfig.add_special_tokens? 1: 0;
 
         LastTokensManager tokensManager (batch, generationConfig.last_n);
         std::vector <bool> isEnding = std::vector <bool> (batch, false);
         FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+        ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
+// ClearProfiler();
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
                                                  generationConfig, tokensManager);
+// PrintProfiler();
             for (int i = 0; i < batch; i++) {
                 tokensManager.units[i].Push(ret[i]);
             }
@@ -205,7 +327,7 @@ namespace fastllm {
             for (int i = 0; i < batch; i++) {
                 fret.push_back(ret[i]);
                 inputTokens[i] = std::vector <float> {(float)ret[i]};
-                if (ret[i] == eos_token_id) {
+                if (ret[i] == eos_token_id || eos_token_ids.find(ret[i]) != eos_token_ids.end()) {
                     isEnding[i] = true;
                 } else {
                     auto itStopTk = generationConfig.stop_token_ids.find(ret[i]);
@@ -256,6 +378,7 @@ namespace fastllm {
             index++;
             params[0]["index"] = index;
             FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+            ToDataType(attentionMask, this->dataType);
             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
 
             if (index == generationConfig.output_token_limit) {
@@ -597,8 +720,9 @@ printf("%d / %d\n", endingCount, batch);
                                 for (int i: it.second->currentTokens) {
                                     tokens[0].push_back(i);
                                 }
-                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask,
-                                                     curPositionIds);
+                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                                ToDataType(attentionMask, model->dataType);
+
                                 seqLens.push_back(inputIds.Count(0));
                                 for (int i = 0; i < inputIds.Count(0); i++) {
                                     ids.push_back(((float *) inputIds.cpuData)[i]);
@@ -649,18 +773,18 @@ auto st = std::chrono::system_clock::now();
                                                                         *positionIds[0],
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                             }
-//PrintProfiler();
 /*
-static int tot = 0;
-printf("len = %d, spend = %f s.\n", (int)seqLens.size(), GetSpan(st, std::chrono::system_clock::now()));
-tot += (int)seqLens.size();
-printf("tot = %d\n", tot);
+PrintProfiler();
+int total = 0;
+for (int i : seqLens) total += i;
+float spend = GetSpan(st, std::chrono::system_clock::now());
+printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
 */
                             model->dictLocker.lock();
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
                                 int curRet = ret[i];
-                                if (curRet == model->eos_token_id) {
+                                if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                     it.second->isEnding = true;
                                 } else {
                                     auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
@@ -698,7 +822,7 @@ printf("tot = %d\n", tot);
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
-        context->Init(this->block_cnt);
+        context->Init(this->block_cnt, this->dataType);
         context->currentTokens = inputTokens;
         context->generationConfig = generationConfig;
         context->tokens = LastTokensUnit(generationConfig.last_n);
@@ -769,6 +893,32 @@ printf("tot = %d\n", tot);
     void basellm::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                const std::map <std::string, int> &params,
                                Data &inputIds, Data &attentionMask, Data &positionIds) {
+        inputIds.ToDevice(DataDevice::CPU);
+        attentionMask.ToDevice(DataDevice::CPU);
+        positionIds.ToDevice(DataDevice::CPU);
+
+        int index = params.find("index")->second;
+        int promptLen = params.find("promptLen")->second;
+
+        if (inputTokens[0].size() > 1) {
+            int seqLen = inputTokens[0].size();
+
+            std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
+            std::vector <float> vpids = std::vector <float> (seqLen, 0);
+            for (int i = 0; i < seqLen; i++) {
+                vpids[i] = promptLen - seqLen + i;
+                for (int j = i + 1; j < seqLen; j++) {
+                    vmask[i * promptLen + (promptLen - seqLen + j)] = 1;
+                }
+            }
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, promptLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+        } else {
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
+            attentionMask = Data();
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) promptLen + index - 1}));
+        }
     }
 
     // 根据输入的tokens生成LLM推理的输入
@@ -786,5 +936,92 @@ printf("tot = %d\n", tot);
 
     void basellm::DisableAdapter() {
         adapterName = "";
+    }
+
+    bool basellm::SetSaveHistoryChat(bool save) {
+        if (this->model_type == "llama" || 
+            this->model_type == "moe" || 
+            this->model_type == "internlm" || 
+            this->model_type == "qwen2_moe" || 
+            this->model_type == "deepseek_v2" ||
+            this->model_type == "qwen") {
+            this->saveHistoryChat = save;
+            return true;
+        }
+        return false;
+    }
+
+    void basellm::SetDataType(DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+
+        } else if (dataType == DataType::FLOAT16) {
+            AssertInFastLLM(this->model_type == "chatglm" || this->model_type == "llama", 
+                            this->model_type + " doesn't support float16");
+        } else {
+            ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
+        }
+        this->dataType = dataType;
+    }
+
+    JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
+        JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
+        for (auto &message : messages) {
+            ret["messages"].arrayValue.push_back({
+                {"role", message.first},
+                {"content", message.second}
+            });
+        }
+        return ret;
+    }
+
+    std::string basellm::ApplyChatTemplate(const ChatMessages &messages) {
+        if (this->weight.tokenizer.chatTemplate == "") {
+            std::string ret = "";
+            std::string user = "";
+            int round = 0;
+            for (auto &message : messages) {
+                if (message.first == "user") {
+                    user = message.second;
+                } else if (message.first == "assistant") {
+                    ret = MakeHistory(ret, round++, user, message.second);
+                }
+            }
+            ret = MakeInput(ret, round, user);
+            return ret;
+        }
+        return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
+    }
+
+    std::vector <int> basellm::ApplyChatTemplateToTokens(const ChatMessages &messages) {
+        auto prompt = this->ApplyChatTemplate(messages);
+        auto input = this->weight.tokenizer.Encode(prompt);
+        std::vector<int> tokens;
+        for (int i = 0; i < input.Count(0); i++) {
+            tokens.push_back(((float *) input.cpuData)[i]);
+        }
+        return tokens;
+    }
+
+    std::string basellm::ApplyChatTemplate(const JinjaVar &var) {
+        AssertInFastLLM(this->weight.tokenizer.chatTemplate != "", 
+                        "ApplyChatTemplate error: model doesn't has chat_template.");
+        JinjaVar local = var;
+        for (auto &it : this->weight.tokenizer.tokenizerConfig.object_items()) {
+            if (it.first != "messages" && it.second.is_string()) {
+                local[it.first] = it.second.string_value();
+            }
+        }
+        JinjaTemplate temp = JinjaTemplate(this->weight.tokenizer.chatTemplate);
+        return temp.Apply(local);
+    }
+
+    std::vector <int> basellm::ApplyChatTemplateToTokens(const JinjaVar &var) {
+        auto prompt = this->ApplyChatTemplate(var);
+        auto input = this->weight.tokenizer.Encode(prompt);
+        std::vector<int> tokens;
+        for (int i = 0; i < input.Count(0); i++) {
+            tokens.push_back(((float *) input.cpuData)[i]);
+        }
+        return tokens;    
     }
 }

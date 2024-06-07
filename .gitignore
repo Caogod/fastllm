@@ -2,10 +2,7 @@
 *.pyc
 token
 /cmake-build-debug/
-/build-tfacc/
-/build-android/
-/build-py/
-/build/
+/build*
 /pyfastllm/build/
 /pyfastllm/dist/
 /.idea/
@@ -31,5 +28,7 @@ token
 /example/Android/LLMAssistant/.externalNativeBuild
 /example/Android/LLMAssistant/.cxx
 /example/Android/LLMAssistant/local.properties
-/test/cmmlu/result/
+/test/cmmlu/results/
 /models/
+/localtest/
+/third_party/tfacc/driver/tfacc2/result

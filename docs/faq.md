@@ -43,6 +43,21 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
  if (PY_API)
 ```
 
+### identifier "__hdiv" is undefined
+
+**现象：**
+
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "hexp" is undefined  
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "__hdiv" is undefined  
+> ...
+
+**原因：** [计算能力（Compute Capability）](https://developer.nvidia.com/cuda-gpus) <= 5.3 的GPU不支持半精度计算。
+
+**解决办法：** 如需要支持这些GPU，执行cmake时使用编译选项`CUDA_NO_TENSOR_CORE`：
+
+```shell
+cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
+```
 
 ## Windows
 
@@ -55,13 +70,19 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 > include\fastllm.h(234): error : identifier "DataDevice" is undefined  
 > ....
 
-**解决办法：** 使用cmake构建通常不存在这一问题。参考 [example\README.md](/example/README.md)。签出代码后，**修改 include/fastllm.h**，Visual Studio中点击”文件“ -> "高级保存选项"，在编码中选择”Unicode (UTF-8 **带签名**) -代码页 65001“，或在其他文本编辑器中转为”UTF-8 BOM“编码。（由于linux下gcc不识别BOM头，MSVC依赖BOM判断文件编码，该修改只能手动处理。）
+**解决办法：** 参考 [example\README.md](/example/README.md)。签出代码后，**修改 include/fastllm.h**，Visual Studio中点击”文件“ -> "高级保存选项"，在编码中选择”Unicode (UTF-8 **带签名**) -代码页 65001“，或在其他文本编辑器中转为”UTF-8 BOM“编码。（由于linux下gcc不识别BOM头，MSVC依赖BOM判断文件编码，该修改只能手动处理。）
 
 ### main.exe 无法识别中文输入
 
 **原因：** Windows下cmd不支持UTF-8编码，
 
 **解决办法：** 编译[Win32Demo](/example/README.md#win32demo-windows平台) 或使用 [WebUI](/example/README.md#web-ui)
+
+### Windows（MSVC）编译下，int4出现乱码
+
+**原因：** MSVC编译器优化选项 "`/Ob2`"、"`/Ob3`"与的现有代码冲突，
+
+**解决办法：** 编译时，在”属性“中找到"C/C++" -> "优化" -> "内联函数扩展" 中选择“只适用于 __inline (/Ob1)”。
 
 ### 导入提示 FileNotFoundError
 

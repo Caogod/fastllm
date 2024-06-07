@@ -40,6 +40,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
@@ -70,6 +71,11 @@ bool FastllmCudaBatchMatMulTransBBatch(void **i0s, void **i1s, void **os,
 bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
                                        int *ns, int *ms, int *ks,
                                        int *i0Strides, int *i1Strides, float alpha, int batch);
+
+bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+                          const fastllm::Data &mask, const fastllm::Data &output, int group, float scale);
+bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+
 void FastllmCudaSetDevice(int gpu_id);
 #ifdef  __cplusplus
 }

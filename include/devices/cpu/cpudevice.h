@@ -6,9 +6,24 @@
 #define FASTLLM_CPUDEVICE_H
 
 #include "device.h"
-#include "cputhreadpool.h"
+#include "alivethreadpool.h"
 
 namespace fastllm {
+    struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
+        float *input;
+        uint8_t *output;
+        LowBitConfig *configs;
+        int n, m, group, groupCnt;
+        float *inputSums, *iscales, *izeros;
+
+        MultiThreadOnlineQuantizationOp (float *input, uint8_t *output, LowBitConfig *configs, int n, int m, int group, int groupCnt,
+                                        float *inputSums, float *iscales, float *izeros) :
+                input(input), output(output), configs(configs), n(n), m(m), group(group), groupCnt(groupCnt), 
+                inputSums(inputSums), iscales(iscales), izeros(izeros) {} ;
+
+        void Run();
+    };
+
     class CpuDevice : BaseDevice {
     public:
         CpuDevice ();
@@ -20,7 +35,6 @@ namespace fastllm {
         bool CopyDataFromCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
 
         int threads = 4;
-        ThreadPool *threadPool = nullptr;
     };
 
     class CpuToFloat16 : BaseOperator {
@@ -33,6 +47,12 @@ namespace fastllm {
 
     class CpuAttention : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    protected:
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuMergeMOE : BaseOperator {
+    protected:
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -51,6 +71,8 @@ namespace fastllm {
 
     class CpuLinearOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    protected:
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -64,8 +86,14 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
-    class CpuCatDirectOp : BaseOperator {
+    class CpuRepeatOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuCatDirectOp : BaseOperator {
+        protected:
+            void  Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
     class CpuMatMulOp : BaseOperator {
@@ -83,6 +111,14 @@ namespace fastllm {
     };
 
     class CpuSiluOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuTanHOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuGeluOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -108,6 +144,10 @@ namespace fastllm {
     };
 
     class CpuAttentionMaskOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuAttentionExtendedMaskOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -183,6 +223,10 @@ namespace fastllm {
     };
 
     class CpuCatDirectBatchOp : BaseBatchOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuAppendKVCacheBatchOp : BaseBatchOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

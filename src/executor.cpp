@@ -13,11 +13,18 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
+#ifdef USE_TFACC
+#include "devices/tfacc/tfaccdevice.h"
+#endif
+
 namespace fastllm {
     Executor::Executor() {
         this->devices.clear();
 #ifdef USE_CUDA
         this->devices.push_back((BaseDevice*) new CudaDevice());
+#endif
+#ifdef USE_TFACC
+        this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }
@@ -59,6 +66,11 @@ namespace fastllm {
             }
         }
         return {0};
+    }
+
+    bool Executor::CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
+                       const fastllm::IntDict &intParams) {     
+        return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
     }
 
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,

@@ -19,7 +19,8 @@
 #include <memory>
 #include <locale>
 #include <codecvt>
-#include "devices/cpu/cputhreadpool.h"
+#include "devices/cpu/alivethreadpool.h"
+#include "json11.hpp"
 
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -35,7 +36,7 @@ namespace fastllm {
     bool GetLowMemMode();
     int GetThreads();
     bool GetKVCacheInCPU();
-    ThreadPool *GetPool();
+    AliveThreadPool *GetAlivePool();
 
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
@@ -46,6 +47,7 @@ namespace fastllm {
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
         bool output_logits = false; // 是否返回logits
         bool enable_hash_id = false; // 给会话添加hash id
+        bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
 
         bool IsSimpleGreedy() const {
@@ -173,6 +175,7 @@ namespace fastllm {
     enum DataType {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
+        INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
         INT32PARAM = 100 // int32的参数，这种类型的数据永远存在CPU上
     };
 
@@ -181,7 +184,7 @@ namespace fastllm {
     };
 
     enum WeightType {
-        NONE = 0, LINEAR = 1, EMBEDDING = 2
+        NONE = 0, LINEAR = 1, EMBEDDING = 2, AUTO = 99999
     };
 
     struct FileMmap {
@@ -219,6 +222,11 @@ namespace fastllm {
 
     class Data {
     public:
+        bool isFake = false; // 没有创建空间，指向别的data（无需销毁）
+
+        long long cacheUid = 0; // 用来标注Cache id
+        bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 
@@ -235,6 +243,7 @@ namespace fastllm {
 
 	    void *cudaData = nullptr;
         std::vector <void*> extraCudaData;
+        std::vector <void*> extraCudaHalfData;
 
         void *deviceData = nullptr;
         std::vector <void*> extraDeviceData;
@@ -242,13 +251,20 @@ namespace fastllm {
         DataDevice dataDevice = DataDevice::CPU;
         std::vector <int> dataDeviceIds;
 
-        // 这两个参数用于量化，对FLOAT数据不适用
+        // 以下参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
+        int group = -1, groupCnt = -1; // 分组量化，group代表组数，groupCnt代表每组有多少个元素，-1代表不使用分组量化
+
+        // 以下为每个通道/分组的量化参数
+        // 1. 若不使用分通道量化，那么总组数 = 1
+        // 2. 若使用分通道量化，那么总组数 = 通道数
+        // 3. 若使用分组量化，那么总组数 = 通道数 * 组数(group)
         std::vector <LowBitConfig> perChannelsConfigs; // perChannelsConfigs[i]代表第i个通道的min, max; 如果没有分通道，perChannelsConfigs[0]代表全局min, max
         std::vector <float> scales, mins;
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
+        std::string name; // weightName
         std::string fileName;
         long long filePos;
         std::shared_ptr<FileMmap> mapFile;
@@ -269,7 +285,11 @@ namespace fastllm {
 
         Data (const Data &ori); // 深拷贝
 
+        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, int groupCnt = -1); // 从oriData中创建
+
         void CopyFrom(const Data &ori); // 复制
+
+        void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
 
         uint64_t GetBytes() const; // 获取总字节数
 
@@ -308,6 +328,25 @@ namespace fastllm {
         void SetMapFile(std::shared_ptr<FileMmap> file) {
         	mapFile = file;
         }
+
+        void SetKVCache();
+    };
+
+    struct PartitionLinkNode {
+        std::pair <int, int> *cur = nullptr;
+        PartitionLinkNode *next = nullptr;
+        PartitionLinkNode *prev = nullptr;
+        int id = -1;
+
+        PartitionLinkNode *Skip(int t) {
+            PartitionLinkNode *ret = this;
+            while (t--) {
+                if (ret != nullptr) {
+                    ret = ret->next;
+                }
+            }
+            return ret;
+        }
     };
 
     struct Tokenizer {
@@ -315,7 +354,8 @@ namespace fastllm {
             BPE = 0,
             NORMAL = 1,
             QWEN = 2,
-            GLM = 3
+            GLM = 3,
+            BERT = 4
         };
 
         struct TrieNode {
@@ -359,6 +399,9 @@ namespace fastllm {
             return a.score < b.score || (a.score == b.score && a.l > b.l);
         }
 
+        json11::Json tokenizerConfig;
+        std::string chatTemplate = "";
+
         TrieNode *root;
 
         TrieNode *specialRoot = nullptr;
@@ -389,11 +432,15 @@ namespace fastllm {
 
         void TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q); // 插入备选symbol
 
+        int GetRank(std::vector <Symbol> &symbols, PartitionLinkNode *cur, int skip);
+
         int GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip);
 
         void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
 
         void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
+
+        void SetTokenizerConfig(const json11::Json &config);
 
         std::string Normalize(const std::string &ori); // 字符规范化
 
@@ -402,6 +449,10 @@ namespace fastllm {
         std::string Decode(const Data &data); // 解码
 
         std::string DecodeTokens(const std::vector <int> &tokens); // 解码
+
+        int GetTokenId(const std::string &s); // 获取s对应的tokenid
+
+        std::string GetToken(int id); // 获取id对应的token
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
@@ -419,6 +470,8 @@ namespace fastllm {
 
         std::set <std::string> embeddingNames;
 
+        std::set <std::string> linearNames;
+
         void LoadFromFile(const std::string &fileName); // 从文件读取
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型, bit = 0代表直接存
@@ -429,13 +482,18 @@ namespace fastllm {
 
         void AddAdapterDict(const std::string &name, const std::string &key, const std::string &value);
 
+        void AddEmptyWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType);
+
         void AddWeight(const std::string &key, const std::vector <int> &dims,
-                       DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
+                       DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData,
+                       int groupCnt = -1); // 插入一个权重
 
         void ReleaseWeight(); // 释放所有权重占用的空间
 
         void AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
                               int bit, float *scales, uint8_t *oriData); // 插入一个Qlinear层的权重，量化规则为float value = scales * oriData
+
+        WeightType GetWeightType(const std::string &key); // 获取某个权重的类型（若未判断出来，则为None)
 
         Data &operator [] (const std::string &key);
     };
@@ -453,6 +511,10 @@ namespace fastllm {
 
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
+    bool CanRunMergeMOE();
+    void MergeMOE(const Data &input, const Data &logits, std::vector <Data*> weights, std::vector <Data*> biass, 
+                float routeScale, float sharedScale, int topk, Data &output);
+
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
 
@@ -468,20 +530,37 @@ namespace fastllm {
 
     void Linear(Data &input, Data &weight, const Data &bias, Data &output);
 
+    enum LinearExType {
+        ExTypeNone = 0,
+        ExSwiglu = 1,
+        ExGelu = 2,
+        ExSilu = 3
+    };
+    
+    bool CanRunLinearEx(LinearExType exType);
+    void LinearEx(Data &input, Data &weight, const Data &bias, Data &output,
+                    LinearExType exType); // 扩展Linear，可以接后续操作
+
     void Split(const Data &input, int axis, int start, int end, Data &output);
+
+    void Repeat(const Data &input, int axis, int repeatTimes, Data &output);
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
 	void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
-    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0);
+    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0, int group = 1);
 
-    void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha = 1.0);
+    void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha = 1.0, int group = 1);
 
     void Softmax(const Data &input, Data &output, int axis);
 
     void Silu(const fastllm::Data &input, fastllm::Data &output);
 
+    void TanH(const Data &input, Data &output);
+
+    void Gelu(const Data &input, Data &output);
+    
     void GeluNew(const Data &input, Data &output);
 
     void Swiglu(const fastllm::Data &input, fastllm::Data &output);
@@ -493,6 +572,8 @@ namespace fastllm {
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
 
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
+
+    void AttentionExtendedMask(Data &input, const Data &mask); // bert中的extended mask
 
     void AlibiMask(Data &input, const Data &mask, float maskValue); // alibi mask
 
@@ -525,6 +606,8 @@ namespace fastllm {
     void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis);
 
     void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis);
+
+    void AppendKVCacheBatch(std::vector <Data*> &cache, const Data &input);
 
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
                    std::map <std::string, std::string> loraConfig);

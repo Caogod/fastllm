@@ -155,11 +155,15 @@ cd tools # 这时在fastllm/build/tools目录下
 python setup.py install
 ```
 
+其他不同平台的编译可参考文档
+[TFACC平台](docs/tfacc.md)
+
 ### 运行demo程序
 
 我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
 
 编译完成之后在build目录下可以使用下列demo:
+
 ``` sh
 # 这时在fastllm/build目录下
 
@@ -176,6 +180,8 @@ python tools/cli_demo.py -p model.flm
 streamlit run tools/web_demo.py model.flm 
 
 ```
+
+Windows下的编译推荐使用Cmake GUI + Visual Studio，在图形化界面中完成。
 
 如编译中存在问题，尤其是Windows下的编译，可参考[FAQ](docs/faq.md)
 
@@ -370,20 +376,15 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 一些模型的转换可以[参考这里的例子](docs/llama_cookbook.md)
 
 #### QWEN模型导出
+* **Qwen**
 ```sh
 # 需要先安装QWen环境
 # 如果使用自己finetune的模型需要修改qwen2flm.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
+cd build
 python3 tools/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
 python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
 python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
-```
-
-#### MINICPM模型导出
-```sh
-cd build 
-python tools/minicpm2flm.py #导出float16模型
-./main -p minicpm-2b-float16.flm # 执行模型
 ```
 
 * **Qwen1.5**
@@ -391,10 +392,20 @@ python tools/minicpm2flm.py #导出float16模型
 ```sh
 # 需要先安装QWen2环境（transformers >= 4.37.0）
 # 根据所需的精度，导出相应的模型
+cd build
 python3 tools/llamalike2flm.py qwen1.5-7b-fp16.flm float16 "qwen/Qwen1.5-4B-Chat" #导出wen1.5-4B-Chat float16模型
 python3 tools/llamalike2flm.py qwen1.5-7b-int8.flm int8 "qwen/Qwen1.5-7B-Chat" #导出Qwen1.5-7B-Chat int8模型
 python3 tools/llamalike2flm.py qwen1.5-7b-int4.flm int4 "qwen/Qwen1.5-14B-Chat" #导出Qwen1.5-14B-Chat int4模型
 # 最后一个参数可替换为模型路径
+```
+
+#### MINICPM模型导出
+```sh
+# 需要先安装MiniCPM环境（transformers >= 4.36.0） 
+# 默认脚本导出iniCPM-2B-dpo-fp16模型
+cd build 
+python tools/minicpm2flm.py minicpm-2b-float16.flm #导出dpo-float16模型
+./main -p minicpm-2b-float16.flm # 执行模型
 ```
 
 ## 开发计划

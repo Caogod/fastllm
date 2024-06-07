@@ -10,7 +10,6 @@
 #include <string>
 #include <mutex>
 
-#include "json11.hpp"
 /*
  * Headers
  */
@@ -329,11 +328,15 @@ printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(),
                 results.clear();
                 results.push_back(result);
                 output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
+
+                std::string cur = (message + output);
+                int ret = write(node->client, cur.c_str(), cur.length()); //返回message
             }
         }
 
         message += output;
         int ret = write(node->client, message.c_str(), message.length()); //返回message
+
         close(node->client);
     }
 } workQueue;

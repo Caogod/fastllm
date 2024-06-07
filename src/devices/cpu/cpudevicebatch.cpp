@@ -203,6 +203,25 @@ namespace fastllm {
         delete op;
     }
 
+    void CpuAppendKVCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int batch = intParams.find("caches___batch")->second;
+        Data **caches = (Data**)(datas.find("caches")->second);
+        Data &input = *(datas.find("input")->second);
+
+        int heads = input.dims[1], dims = input.dims[2] * input.unitSize;
+        for (int i = 0; i < batch; i++) {
+            std::vector <int> cacheDims = caches[i]->dims;
+            uint8_t *cur = input.cpuData + i * heads * dims;
+            for (int o = 0; o < heads; o++) {
+                memcpy(caches[i]->cpuData + o * caches[i]->Count(1) * caches[i]->unitSize + cacheDims[1] * dims,
+                   cur + o * dims, dims);
+            }
+            cacheDims[1]++;
+            caches[i]->Resize(cacheDims);
+        }
+    }
+
     void CpuAttentionBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data **qs = (Data**)(datas.find("q")->second);
@@ -220,7 +239,9 @@ namespace fastllm {
         AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
-        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 ||
+                        q.dataType == DataType::FLOAT16, 
+                        "Attention's input's type should be float32 or float16.\n");
 
         for (int i = 0; i < batch; i++) {
             outputs[i]->dataType = qs[i]->dataType;
