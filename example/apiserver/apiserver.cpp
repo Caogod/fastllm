@@ -1,7 +1,6 @@
 // Provide by Jacques CHEN (http://whchen.net/index.php/About.html)
 // HTML file reference from ChatGLM-MNN （https://github.com/wangzhaode/ChatGLM-MNN)
 
-#include "model.h"
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -120,16 +119,56 @@ using socket_t = int;
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include "model.h"
+
+long long _GetCurrentTime() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+}
+
+std::string GenerateRandomID() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 15);
+
+    std::stringstream ss;
+    for (int i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            ss << '-';
+        }
+        ss << std::hex << dis(gen);
+    }
+    return ss.str();
+}
+
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
 
 struct APIConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
-    std::string webPath = "web"; // 网页文件路径
+    std::string modelName = "fastllm";
+
     int threads = 4; // 使用的线程数
     bool lowMemMode = false; // 是否使用低内存模式
+    bool cudaEmbedding = false; // 是否使用cudaEmbedding
     int port = 8080; // 端口号
     int tokens = -1; // token容量限制
     int batch = 256; // batch数限制
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    fastllm::DataType atype = fastllm::DataType::FLOAT32;
+    int groupCnt = -1;
+
+    std::map <std::string, int> devices;
 };
+APIConfig config;
 
 void ToNext(char * &cur, const std::string &target, std::string &v) {
     v = "";
@@ -251,11 +290,7 @@ struct WorkQueue {
             while (true) {
                 std::unique_lock <std::mutex> lock(ts->locker);
                 if (ts->activateQueryNumber >= ts->maxActivateQueryNumber) {
-#ifdef WIN32
-                    Sleep(0);
-#else
-                    sleep(0);
-#endif
+                    fastllm::MySleep(0);
                     continue;
                 }
                 if (ts->q.empty()) {
@@ -285,59 +320,295 @@ struct WorkQueue {
 
     void Deal(WorkNode *node) {
         auto *req = &node->request;
-        if (req->route != "/generate" || req->method != "POST") {
-            close(node->client);
-            return;
-        }
+        if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
+            std::string message = "";
+            message += "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type:application/json\r\n";
+            message += "server:fastllm api server\r\n";
+            message += "\r\n";
 
-        std::string message = "";
-        message += "HTTP/1.1 200 OK\r\n";
-        message += "Content-Type:application/json\r\n";
-        message += "server:fastllm api server\r\n";
-        message += "\r\n";
-
-        if (node->error == "") {
-            if (node->config["prompt"].is_null()) {
-                node->error = "prompt is empty!";
+            if (node->error == "") {
+                if (node->config["prompt"].is_null()) {
+                    node->error = "prompt is empty!";
+                }
             }
-        }
-        if (node->error != "") {
-printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(), node->config["prompt"].string_value().c_str(), node->error.c_str());
-            message += node->error;
-            int ret = write(node->client, message.c_str(), message.length()); //返回error
-            close(node->client);
-            return;
-        }
+            if (node->error != "") {
+                printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(), node->config["prompt"].string_value().c_str(), node->error.c_str());
+                message += node->error;
+                int ret = write(node->client, message.c_str(), message.length()); //返回error
+                close(node->client);
+                return;
+            }
 
-        std::string output = "";
-        auto prompt = model->MakeInput("", 0, node->config["prompt"].string_value());
-        auto inputs = model->weight.tokenizer.Encode(prompt);
-        std::vector<int> tokens;
-        for (int i = 0; i < inputs.Count(0); i++) {
-            tokens.push_back(((float *) inputs.cpuData)[i]);
-        }
-        fastllm::GenerationConfig config;
-        config.output_token_limit = node->config["max_tokens"].is_null() ? 200 : node->config["max_tokens"].int_value();
-        int handleId = model->LaunchResponseTokens(tokens, config);
-        std::vector<float> results;
-        while (true) {
-            int result = model->FetchResponseTokens(handleId);
-            if (result == -1) {
-                break;
+            std::string output = "";
+            bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
+            fastllm::Data inputs;
+            if (rawPrompt) {
+                inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
             } else {
-                results.clear();
-                results.push_back(result);
-                output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
-
-                std::string cur = (message + output);
-                int ret = write(node->client, cur.c_str(), cur.length()); //返回message
+                fastllm::ChatMessages messages;
+                messages.push_back({"user", node->config["prompt"].string_value()});
+                auto prompt = model->ApplyChatTemplate(messages);
+                inputs = model->weight.tokenizer.Encode(prompt);
             }
+            std::vector<int> tokens;
+            for (int i = 0; i < inputs.Count(0); i++) {
+                tokens.push_back(((float *) inputs.cpuData)[i]);
+            }
+            fastllm::GenerationConfig config;
+            config.output_token_limit = node->config["max_tokens"].is_null() ? 200 : node->config["max_tokens"].int_value();
+            int handleId = model->LaunchResponseTokens(tokens, config);
+            std::vector<float> results;
+            while (true) {
+                int result = model->FetchResponseTokens(handleId);
+                if (result == -1) {
+                    break;
+                } else {
+                    results.clear();
+                    results.push_back(result);
+                    output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
+
+                    std::string cur = (message + output);
+                    int ret = write(node->client, cur.c_str(), cur.length()); //返回message
+                }
+            }
+
+            message += output;
+            int ret = write(node->client, message.c_str(), message.length()); //返回message
+
+            close(node->client);
+        } else if ((req->route == "/v1/chat/completions" || req->route == "/v1/chat/completions/") && req->method == "POST") {
+            std::string message = "";
+            message += "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type:application/json\r\n";
+            message += "server:fastllm api server\r\n";
+            message += "\r\n";
+
+            fastllm::ChatMessages chatMessages;
+            if (node->config["messages"].is_array()) {
+                for (auto &it : node->config["messages"].array_items()) {
+                    chatMessages.push_back({it["role"].string_value(), it["content"].string_value()});
+                }
+            } else if (node->config["prompt"].is_string()) {
+                chatMessages.push_back({"user", node->config["prompt"].string_value()});
+            } else {
+                node->error = "no input.\n";
+            }
+
+            if (node->config["model"].string_value() != ::config.modelName) {
+                node->error = "The model `" + node->config["model"].string_value() + "` does not exist.";
+            }
+
+            if (node->error != "") {                
+                message += node->error;
+                int ret = write(node->client, message.c_str(), message.length()); //返回error
+                close(node->client);
+                return;
+            }
+
+            bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
+            fastllm::Data inputs;
+            if (rawPrompt) {
+                if (!node->config["prompt"].is_string()) {
+                    node->error = "raw_prompt requires a string prompt.\n";
+                } else {
+                    inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
+                }
+            } else {
+                auto prompt = model->ApplyChatTemplate(chatMessages);
+                inputs = model->weight.tokenizer.Encode(prompt);
+            }
+            if (node->error != "") {
+                message += node->error;
+                int ret = write(node->client, message.c_str(), message.length());
+                close(node->client);
+                return;
+            }
+            std::vector<int> tokens;
+            for (int i = 0; i < inputs.Count(0); i++) {
+                tokens.push_back(((float *) inputs.cpuData)[i]);
+            }
+
+            fastllm::GenerationConfig config;
+            config.output_token_limit = !node->config["max_tokens"].is_number() ? 256 : node->config["max_tokens"].int_value();
+            if (node->config["frequency_penalty"].is_number()) {
+                config.repeat_penalty = node->config["frequency_penalty"].number_value();
+            }
+            if (node->config["temperature"].is_number()) {
+                config.temperature = node->config["temperature"].number_value();
+            }
+            if (node->config["top_p"].is_number()) {
+                config.top_p = node->config["top_p"].number_value();
+            }
+            if (node->config["top_k"].is_number()) {
+                config.top_k = node->config["top_k"].number_value();
+            }
+
+            std::string output = "";
+            int handleId = model->LaunchResponseTokens(tokens, config);
+            bool isStream = false;
+            if (node->config["stream"].is_bool() && node->config["stream"].bool_value()) {
+                isStream = true;
+            }
+
+            std::string curId = "fastllm-" + GenerateRandomID();
+            auto createTime = _GetCurrentTime();
+
+            if (isStream) {
+                message = "";
+                message += "HTTP/1.1 200 OK\r\n";
+                message += "Content-Type:application/json\r\n";
+                message += "server:fastllm api server\r\n";
+                message += "Transfer-Encoding: chunked\r\n";
+                message += "\r\n";
+                int ret = write(node->client, message.c_str(), message.length()); //返回初始信息
+            
+                json11::Json startResult = json11::Json::object {
+                    {"id", curId},
+                    {"object", "chat.completion.chunk"},
+                    {"created", createTime},
+                    {"model", ::config.modelName},
+                    {"choices", json11::Json::array {
+                        json11::Json::object {
+                            {"index", 0},
+                            {"delta", json11::Json::object {
+                                {"role", "assistant"}
+                            }},
+                            {"logprobs", nullptr},
+                            {"finish_reason", nullptr},
+                            {"stop_reason", nullptr}
+                        }
+                    }}
+                };
+                std::string cur = ("data: " + startResult.dump() + "\r\n");
+
+                char chunk_header[50];
+                sprintf(chunk_header, "%zx\r\n", cur.size());
+                ret = write(node->client, chunk_header, strlen(chunk_header));
+                ret = write(node->client, cur.data(), cur.size());
+                ret = write(node->client, "\r\n", 2);
+
+                int outputTokens = 0;
+                std::vector<float> results;
+                while (true) {
+                    int result = model->FetchResponseTokens(handleId);
+                    if (result == -1) {
+                        json11::Json partResult = json11::Json::object {
+                            {"id", curId},
+                            {"object", "chat.completion.chunk"},
+                            {"created", createTime},
+                            {"model", ::config.modelName},
+                            {"choices", json11::Json::array {
+                                json11::Json::object {
+                                    {"index", 0},
+                                    {"delta", json11::Json::object {
+                                        {"content", ""}
+                                    }},
+                                    {"logprobs", nullptr},
+                                    {"finish_reason", nullptr},
+                                    {"stop_reason", nullptr}
+                                }
+                            }},
+                            {"usage", json11::Json::object {
+                                {"prompt_tokens", (int)tokens.size()},
+                                {"total_tokens", (int)tokens.size() + outputTokens},
+                                {"completion_tokens", outputTokens}
+                            }}
+                        };
+
+                        std::string cur = ("data: " + partResult.dump() + "\r\n");
+                        sprintf(chunk_header, "%zx\r\n", cur.size());
+                        ret = write(node->client, chunk_header, strlen(chunk_header));
+                        ret = write(node->client, cur.data(), cur.size());
+                        ret = write(node->client, "\r\n", 2);
+                        break;
+                    } else {
+                        outputTokens++;
+                        results.clear();
+                        results.push_back(result);
+                        std::string now = model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
+                        json11::Json partResult = json11::Json::object {
+                            {"id", curId},
+                            {"object", "chat.completion.chunk"},
+                            {"created", createTime},
+                            {"model", ::config.modelName},
+                            {"choices", json11::Json::array {
+                                json11::Json::object {
+                                    {"index", 0},
+                                    {"delta", json11::Json::object {
+                                        {"content", now}
+                                    }},
+                                    {"logprobs", nullptr},
+                                    {"finish_reason", nullptr},
+                                    {"stop_reason", nullptr}
+                                }
+                            }}
+                        };
+
+                        std::string cur = ("data: " + partResult.dump() + "\r\n");
+                        sprintf(chunk_header, "%zx\r\n", cur.size());
+                        ret = write(node->client, chunk_header, strlen(chunk_header));
+                        ret = write(node->client, cur.data(), cur.size());
+                        ret = write(node->client, "\r\n", 2);
+                    }
+                }
+
+                cur = ("data: [DONE]");
+                sprintf(chunk_header, "%zx\r\n", cur.size());
+                ret = write(node->client, chunk_header, strlen(chunk_header));
+                ret = write(node->client, cur.data(), cur.size());
+                ret = write(node->client, "\r\n", 2);
+
+                ret = write(node->client, "0\r\n\r\n", 5);
+                close(node->client);
+            } else {
+                int outputTokens = 0;
+                std::vector<float> results;
+                while (true) {
+                    int result = model->FetchResponseTokens(handleId);
+                    if (result == -1) {
+                        break;
+                    } else {
+                        results.clear();
+                        results.push_back(result);
+                        output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
+                        outputTokens++;
+                    }
+                }
+
+                json11::Json result = json11::Json::object {
+                    {"id", curId},
+                    {"object", "chat.completion"},
+                    {"created", createTime},
+                    {"model", ::config.modelName},
+                    {"choices", json11::Json::array {
+                        json11::Json::object {
+                            {"index", 0},
+                            {"message", json11::Json::object {
+                                {"role", "assistant"},
+                                {"content", output}
+                            }},
+                            {"logprobs", nullptr},
+                            {"finish_reason", nullptr},
+                            {"stop_reason", nullptr}
+                        }
+                    }},
+                    {"usage", json11::Json::object {
+                        {"prompt_tokens", (int)tokens.size()},
+                        {"total_tokens", (int)tokens.size() + outputTokens},
+                        {"completion_tokens", outputTokens}
+                    }}
+                };
+
+                message += result.dump();
+                int ret = write(node->client, message.c_str(), message.length()); //返回message
+                close(node->client);
+            }
+            return;
+        } else {
+            close(node->client);
+            return;
         }
-
-        message += output;
-        int ret = write(node->client, message.c_str(), message.length()); //返回message
-
-        close(node->client);
     }
 } workQueue;
 
@@ -345,12 +616,16 @@ void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-    std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
-    std::cout << "<--batch>:                    最大batch数" << std::endl;
-    std::cout << "<--tokens>:                   最大tokens容量" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
+    std::cout << "<--batch> <args>:             最大batch数" << std::endl;
+    std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
+    std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
+    std::cout << "<--cuda_embedding>:           使用cuda来执行embedding" << std::endl;
+    std::cout << "<--device>:                   执行设备" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, APIConfig &config) {
@@ -368,14 +643,32 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.threads = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-l" || sargv[i] == "--low") {
             config.lowMemMode = true;
-        } else if (sargv[i] == "-w" || sargv[i] == "--web") {
-            config.webPath = sargv[++i];
+        } else if (sargv[i] == "--cuda_embedding"){
+            config.cudaEmbedding = true;
         } else if (sargv[i] == "--port") {
             config.port = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "--tokens") {
             config.tokens = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--batch") {
             config.batch = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--atype") {
+            std::string atypeStr = sargv[++i];
+            fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
+                                    "Unsupport act type: " + atypeStr);
+            config.atype = dataTypeDict[atypeStr];
+        } else if (sargv[i] == "--model_name") {
+            config.modelName = sargv[++i];
+        } else if (sargv[i] == "--device") {
+            config.devices[sargv[++i]] = 1;
         } else {
             Usage();
             exit(-1);
@@ -388,13 +681,23 @@ std::string url = "generate";
 std::mutex locker;
 
 int main(int argc, char** argv) {
-    APIConfig config;
     ParseArgs(argc, argv, config);
 
+    if (config.devices.size() != 0) {
+        fastllm::SetDeviceMap(config.devices);
+    }
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    workQueue.model = fastllm::CreateLLMModelFromFile(config.path);
+    fastllm::SetCudaEmbedding(config.cudaEmbedding);
+    if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
+        : fastllm::CreateLLMModelFromFile(config.path);
     workQueue.model->tokensLimit = config.tokens;
+    workQueue.model->SetDataType(config.atype);
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
 
@@ -407,7 +710,7 @@ int main(int argc, char** argv) {
 
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(8080);  //绑定端口
+    local_addr.sin_port = htons(config.port);  //绑定端口
     local_addr.sin_addr.s_addr = INADDR_ANY; //绑定本机IP地址
 
     //3.bind()： 将一个网络地址与一个套接字绑定，此处将本地地址绑定到一个套接字上
@@ -417,8 +720,7 @@ int main(int argc, char** argv) {
         exit(-1);
     }
     std::cout << "bind ready!" << std::endl;
-
-    listen(local_fd, 2000);
+    listen(local_fd, 2000);    
     printf("start...\n");
     int queuePos = 0;
     while (true) { //循环接收客户端的请求
@@ -442,11 +744,7 @@ int main(int argc, char** argv) {
         buff[size] = 0;
 
         while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
-#ifdef WIN32
-                    Sleep(0);
-#else
-                    sleep(0);
-#endif
+            fastllm::MySleep(0);
         }
         workQueue.Push(buff, client);
     }

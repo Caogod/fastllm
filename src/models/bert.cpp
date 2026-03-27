@@ -31,11 +31,27 @@ namespace fastllm {
         this->head_dim = embed_dim / num_attention_heads;
     }
 
-    std::vector <std::vector <float> > BertModel::Forward(
+    void BertModel::Normalize(float *data, int dataLen) {
+        float sum = 0.0;
+        for (int i = 0; i < dataLen; i++) {
+            sum += data[i] * data[i];
+        }
+        if (sum < 1e-6) {
+            sum = 1e-6;
+        } else {
+            sum = sqrt(sum);
+        }
+        for (int i = 0; i < dataLen; i++) {
+            data[i] = data[i] / sum;
+        }
+    }
+
+    std::vector <std::vector <float> > BertModel::ForwardAll(
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &tokenTypeIds,
-                const Data &positionIds) {
+                const Data &positionIds,
+                bool normalize) {
         // embedding
         Data inputEmbeddings, tokenTypeEmbeddings, positionIdEmbeddings;
         Embedding(inputIds, this->weight["embeddings.word_embeddings.weight"], inputEmbeddings);
@@ -79,7 +95,10 @@ namespace fastllm {
             PermuteSelf(k, {0, 2, 1, 3});
             PermuteSelf(v, {0, 2, 1, 3});
             MatMulTransB(q, k, qk, 1.0 / sqrt(this->head_dim), 1);
-            AttentionExtendedMask(qk, attentionMask);
+            std::vector <int> dims = qk.dims;
+            qk.Resize({dims[0], -1, dims[3]});
+            AttentionMask(qk, attentionMask, -1e9);
+            qk.Resize(dims);
 
             Softmax(qk, qk, -1);
             MatMul(qk, v, qkv, 1.0, 1);
@@ -114,19 +133,76 @@ namespace fastllm {
         std::vector <std::vector <float> > ret;
         ret.resize(batch, std::vector <float> (outputDim, 0.0f));
         for (int i = 0; i < batch; i++) {
+            if (normalize) {
+                Normalize(fret + i * outputDim, outputDim);
+            }
             memcpy(ret[i].data(), fret + i * outputDim, outputDim * sizeof(float));
         }
 
         return ret;
     }
 
-    std::vector <float> BertModel::EmbeddingSentence(const std::string &context) {
-        std::vector <std::string> contexts;
-        contexts.push_back(context);
-        return EmbeddingSentenceBatch(contexts)[0];
+    // 根据输入的input
+    void BertModel::FillBertInputsBatch(const std::vector <std::vector <int> > &tokens,
+                            Data &inputIds, Data &attentionMask, Data &tokenTypeIds, Data &positionIds) {
+        int batch = tokens.size(), len = 0;
+        for (int i = 0; i < batch; i++) {
+            len = std::max(len, (int)tokens[i].size());
+        }
+
+        std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
+        std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> attention_mask = std::vector <float> (batch * len, 1);
+        std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
+        for (int i = 0; i < batch; i++) {
+            seqLens[i] = tokens[i].size();
+            for (int j = 0; j < tokens[i].size(); j++) {
+                ids[i * len + j] = tokens[i][j];
+                attention_mask[i * len + j] = 0;
+                position_ids[i * len + j] = j;
+            }
+        }
+        inputIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids));
+        attentionMask.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, attention_mask));
+        tokenTypeIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids));
+        positionIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids));
     }
 
-    std::vector <std::vector <float> > BertModel::EmbeddingSentenceBatch(const std::vector <std::string> &contexts) {
+    std::vector <float> BertModel::ComputeScore(std::vector <std::vector <int> > tokens) {
+        fastllm::Data inputIds, attentionMask, tokenTypeIds, positionIds;
+        FillBertInputsBatch(tokens, inputIds, attentionMask, tokenTypeIds, positionIds);
+        auto ret = ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, false);
+        std::vector <float> lastRet;
+        for (int i = 0; i < ret.size(); i++) {
+            lastRet.push_back(ret[i][0]);
+        }
+        return lastRet;
+    }
+
+    std::vector <float> BertModel::EmbeddingSentence(const std::vector <int> &tokens, bool normalize) {
+        std::vector <std::vector <int> > tokenss;
+        tokenss.push_back(tokens);
+        return EmbeddingSentenceBatch(tokenss, normalize)[0];
+    }
+
+    std::vector <std::vector <float> > BertModel::EmbeddingSentenceBatch(const std::vector <std::vector <int> > &tokens, bool normalize) {
+        fastllm::Data inputIds, attentionMask, tokenTypeIds, positionIds;
+        FillBertInputsBatch(tokens, inputIds, attentionMask, tokenTypeIds, positionIds);
+        int batch = tokens.size(), len = 0;
+        for (int i = 0; i < batch; i++) {
+            len = std::max(len, (int)tokens[i].size());
+        }
+        return ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, normalize);
+    }
+
+    std::vector <float> BertModel::EmbeddingSentence(const std::string &context, bool normalize) {
+        std::vector <std::string> contexts;
+        contexts.push_back(context);
+        return EmbeddingSentenceBatch(contexts, normalize)[0];
+    }
+
+    std::vector <std::vector <float> > BertModel::EmbeddingSentenceBatch(const std::vector <std::string> &contexts, bool normalize) {
         int batch = contexts.size(), len = 0;
         std::vector <std::vector <int> > tokens;
         tokens.resize(batch);
@@ -137,33 +213,41 @@ namespace fastllm {
             }
             len = std::max(len, (int)tokens[i].size());
         }
+        fastllm::Data inputIds, attentionMask, tokenTypeIds, positionIds;
+        FillBertInputsBatch(tokens, inputIds, attentionMask, tokenTypeIds, positionIds);
+        return ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, normalize);
+    }
 
+    void BertModel::WarmUp() {
+        printf("Warmup...\n");
+        int batch = 1, len = 1;
         std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
         std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
         std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
         std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
         std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
-        for (int i = 0; i < batch; i++) {
-            seqLens[i] = tokens[i].size();
-            for (int j = 0; j < tokens[i].size(); j++) {
-                ids[i * len + j] = tokens[i][j];
-                attention_mask[i * len + j] = 0;
-                position_ids[i * len + j] = j;
-            }
-        }
-
         fastllm::Data inputIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids);
-        fastllm::Data attentionMask = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, attention_mask);
-        fastllm::Data tokenTypeIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids);
-        fastllm::Data positionIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids);
-
-// printf("bs = %d, len = %d\n", batch, len); ClearProfiler(); Forward(inputIds, attentionMask, tokenTypeIds, positionIds); PrintProfiler();
-        return Forward(inputIds, attentionMask, tokenTypeIds, positionIds);
+        fastllm::Data attentionMask = fastllm::Data(this->dataType, {batch, len}, attention_mask);
+        fastllm::Data tokenTypeIds = fastllm::Data(this->dataType, {batch, len}, token_type_ids);
+        fastllm::Data positionIds = fastllm::Data(this->dataType, {batch, len}, position_ids);
+        ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, true);
+	    printf("finish.\n");
     }
 
-    void BertModel::WarmUp() {
-        printf("Warmup...\n");
-        EmbeddingSentence({"1"});
-	    printf("finish.\n");
+    int BertModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                            const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                            std::vector <float> *retLogits) {
+        return -1;
+    }
+
+    std::string BertModel::MakeInput(const std::string &history, int round, const std::string &input)
+    {
+        return "";
+    }
+
+    std::string BertModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output)
+    {
+        return "";
     }
 }

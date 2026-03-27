@@ -27,28 +27,20 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 
 **解决办法：**
 
-手动修改 CMakeLists.txt，根据GPU型号手动指定GPU的[Compute Capability](https://developer.nvidia.com/cuda-gpus)。如：
+根据GPU型号手动指定GPU的[Compute Capability](https://developer.nvidia.com/cuda-gpus)。如：
 
-``` diff
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -52,7 +52,7 @@
-     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
-     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
--    set(CMAKE_CUDA_ARCHITECTURES "native")
-+    set(CMAKE_CUDA_ARCHITECTURES 61 75 86 89)
- endif()
- 
- if (PY_API)
+```shell
+cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="61;75;86;89"
 ```
 
-### identifier "__hdiv" is undefined
+若需要支持多种GPU架构，请使用“;”分隔（如上面例子）。
+
+### identifier "\__hdiv" is undefined
 
 **现象：**
 
 > src/devices/cuda/fastllm-cuda.cu(247): error: identifier "hexp" is undefined  
-> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "__hdiv" is undefined  
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "\__hdiv" is undefined  
 > ...
 
 **原因：** [计算能力（Compute Capability）](https://developer.nvidia.com/cuda-gpus) <= 5.3 的GPU不支持半精度计算。
@@ -56,7 +48,23 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 **解决办法：** 如需要支持这些GPU，执行cmake时使用编译选项`CUDA_NO_TENSOR_CORE`：
 
 ```shell
-cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
+cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="52;61" -DCUDA_NO_TENSOR_CORE=ON
+```
+
+### undefined reference to `std::filesystem'
+
+**现象：** 
+
+> CMakeFiles/fastllm.dir/src/model.cpp.o: In function `fastllm::ExportLLMModelFromHF(std::string const&, fastllm::DataType, int, std::string const&, std::string const&, std::string const&, bool, fastllm::DataType, int)':
+> model.cpp:(.text+0x10748): undefined reference to `std::experimental::filesystem::v1::status(std::experimental::filesystem::v1::path const&)'
+> ...
+
+**原因：** 8.0 版本之前的GCC （包括某些 GCC 8.X版本）并不完全支持C++ 17的 `<filesystem>` 库，某些环境需要手动链接。
+
+**解决办法：** 设置`FASTLLM_LINKED_LIBS`，手动指定链接`stdc++fs`
+
+```shell
+cmake .. -DFASTLLM_LINKED_LIBS=stdc++fs
 ```
 
 ## Windows
@@ -82,7 +90,7 @@ cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
 
 **原因：** MSVC编译器优化选项 "`/Ob2`"、"`/Ob3`"与的现有代码冲突，
 
-**解决办法：** 编译时，在”属性“中找到"C/C++" -> "优化" -> "内联函数扩展" 中选择“只适用于 __inline (/Ob1)”。
+**解决办法：** 编译时，在”属性“中找到"C/C++" -> "优化" -> "内联函数扩展" 中选择“只适用于 \__inline (/Ob1)”。
 
 ### 导入提示 FileNotFoundError
 
@@ -108,7 +116,7 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
   * %CUDA_PATH%\bin\cublas64_12.dll
   * %CUDA_PATH%\bin\cublasLt64_12.dll
 
-## fastllm_pytools
+## ftllm
 
 ### 释放内存报错： CUDA error when release memory
 
@@ -121,3 +129,46 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
 **原因：** python解释器在终止时常常会优先终止自己的进程，而没有现先析构调用的第三方库，因此在退出python时CUDA Runtime已关闭，释放显存操作失败。由于大多数时候显存已释放，并不会引起问题。
 
 **解决办法：** python程序退出时，先显式调用 `llm.release_memory()`方法。
+
+### ftllm加载报错
+
+**现象：**
+调用ftllm时报错，显示Load fastllm failed. (或者version `GLIBCXX_3.4.32' not found)
+
+**原因：** 
+可能是GLIBC版本低于运行要求，可能发生于Ubuntu 20.04以下版本
+
+**解决办法：** 
+
+##### 如果使用conda环境
+
+尝试执行
+```
+conda install conda-forge::libstdcxx-ng
+```
+
+安装完成后，使用下面命令检查
+```
+strings $CONDA_PREFIX/lib/libstdc++.so.6 | grep GLIBCXX | sort | uniq
+```
+
+##### 非conda环境
+
+在/etc/apt/sources.list文件末尾增加：
+```
+deb http://mirrors.aliyun.com/ubuntu/ jammy main
+```
+
+然后更新glibc
+```
+sudo apt update
+sudo apt install libc6
+```
+
+更新完成后检查
+```
+ldd --version
+```
+若版本 >= 2.35，说明更新成功，此时应该可以成功载入ftllm了
+
+若仍无法载入，可尝试[源码安装](../README.md#快速开始)

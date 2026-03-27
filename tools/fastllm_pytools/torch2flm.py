@@ -109,15 +109,15 @@ def tofile(exportPath,
            bot_role = None,
            history_sep = None,
            eos_id = None,
-           int4g_groupcnt = -1,
            dtype = "float16"):
+    int4g_groupcnt = -1
     if (dtype.startswith("int4g") and len(dtype) > 5):
         try:
             int4g_groupcnt = int(dtype[5:])
             dtype = "int4g";
         except:
             print("dtype should be like \"int4g256\"")
-            exit(0)    
+            exit(0)
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
@@ -177,10 +177,17 @@ def tofile(exportPath,
         modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
+    if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "name") and tokenizer.name == "GLM4Tokenizer"):
+        # glm-4-chat
+        modelInfo["pre_prompt"] = "";
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.convert_tokens_to_ids("<|user|>")) + ">\n");
+        modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.convert_tokens_to_ids("<|assistant|>")) + ">");
+        modelInfo["history_sep"] = "";
+        modelInfo["tokenizer_class"] = tokenizer.name;
     if "rope_scaling" in modelInfo and isinstance(modelInfo["rope_scaling"], builtins.dict):
         rope_scaling = modelInfo.pop("rope_scaling")
-        modelInfo["rope_scaling.type"] = rope_scaling["type"]
-        modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
+        for key, value in rope_scaling.items():
+            modelInfo["rope_scaling." + key] = value
     if eos_id:
         modelInfo["eos_token_id"] = str(eos_id)
 
@@ -196,7 +203,8 @@ def tofile(exportPath,
                 token_set.add(str(token))
             if len(tokenizer.all_special_tokens) > len(token_set):
                 modelInfo["tokenizer_has_special_tokens"] = "1"
-        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")):
+        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")) \
+                or (hasattr(tokenizer, "sp_tokenizer") and hasattr(tokenizer.sp_tokenizer, "text_tokenizer")):
             try:
                 import sentencepiece.sentencepiece_model_pb2 as model_pb2
                 with open(tokenizer.vocab_file, "rb") as f:
@@ -255,20 +263,20 @@ def tofile(exportPath,
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            if modelInfo["model_type"] == "qwen":
-                pass
-            else:
+            if (str(type(tokenizer.tokenizer)).find("Encoding") == -1):
                 tokenizer = tokenizer.tokenizer
-        if (hasattr(tokenizer, "sp_model")):
-            piece_size = tokenizer.sp_model.piece_size()
+        if (hasattr(tokenizer, "sp_model") or hasattr(tokenizer, "sp_tokenizer")):
+            sp_model = tokenizer.sp_tokenizer.text_tokenizer.sp if hasattr(tokenizer, "sp_tokenizer") else tokenizer.sp_model
+            delta = tokenizer.sp_tokenizer.num_image_tokens if hasattr(tokenizer, "sp_tokenizer") else 0
+            piece_size = sp_model.piece_size()
             fo.write(struct.pack('i', piece_size))
             for i in range(piece_size):
-                s = tokenizer.sp_model.id_to_piece(i).encode()
+                s = sp_model.id_to_piece(i).encode()
                 fo.write(struct.pack('i', len(s)))
                 for c in s:
                     fo.write(struct.pack('i', c))
-                fo.write(struct.pack('i', i))
-                fo.write(struct.pack('f', float(tokenizer.sp_model.get_score(i))))
+                fo.write(struct.pack('i', i + delta))
+                fo.write(struct.pack('f', float(sp_model.get_score(i))))
         else:
             if hasattr(tokenizer, "bpe_ranks"):
                 merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
@@ -278,10 +286,10 @@ def tofile(exportPath,
                 score = merges[v] if v in merges else 1.0
                 # if (modelInfo["model_type"] == "moss"):
                 #     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
-                if (modelInfo["model_type"] == "qwen"):
-                    s = v
-                else:
+                if (isinstance(v, str)):
                     s = v.encode()
+                else:
+                    s = v
                 fo.write(struct.pack('i', len(s)))
                 for c in s:
                     fo.write(struct.pack('i', c))

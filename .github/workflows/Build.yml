@@ -14,28 +14,33 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v2
     
-    - name: Build with arm64-v8a
-      run: |
-        wget https://dl.google.com/android/repository/android-ndk-r21d-linux-x86_64.zip
-        unzip android-ndk-r21d-linux-x86_64.zip
-        export NDK=$GITHUB_WORKSPACE/android-ndk-r21d
-        mkdir build-android
-        cd build-android
+    #- name: Build with arm64-v8a
+    #  run: |
+    #    wget -q https://dl.google.com/android/repository/android-ndk-r22b-linux-x86_64.zip
+    #    unzip android-ndk-r22b-linux-x86_64.zip
+    #    export NDK=$GITHUB_WORKSPACE/android-ndk-r22b
+    #    mkdir build-android
+    #    cd build-android
         #ls ${NDK}/build/cmake/android.toolchain.cmake
-        cmake -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_TOOLCHAIN_FILE=${NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
-        make -j -B
-        cp main fastllm-main-android
+    #    cmake -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_TOOLCHAIN_FILE=${NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
+    #    make -j -B
+    #    cp main fastllm-main-android
         
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libnuma-dev
+
     - name: Build with x86
       run: |
         mkdir build-x86
         cd build-x86
         cmake .. -DUSE_CUDA=OFF
-        make -j
+        make -j $(nproc)
         cp main fastllm-main-x86_64
         
     - name: Export and Upload Artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: Output
         path: |

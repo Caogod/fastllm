@@ -11,15 +11,6 @@
 #include <iostream>
 
 namespace fastllm {
-
-    enum RoPEType { // 位置编码外推类型
-        BASE = 0,
-        LINEAR_SCALE = 1,
-        STATIC_NTK = 2,
-        DYMAMIC_NTK = 3,
-        YARN = 4
-    };
-
     class LlamaModel: public basellm {
     public:
         LlamaModel (); // 构造函数
@@ -56,6 +47,9 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        // 是否需要生成AttentionMask
+        virtual bool NeedAttentionMask(int qlen, int klen);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,

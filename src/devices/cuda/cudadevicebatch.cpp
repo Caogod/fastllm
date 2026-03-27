@@ -242,21 +242,19 @@ namespace fastllm {
         FastllmCudaSoftmaxBatch(inputs, outputs, axis, batch);
     }
 
-    void CudaCatDirectBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data **input0s = (Data**)(datas.find("input0")->second);
-        Data **input1s = (Data**)(datas.find("input1")->second);
-        int batch = intParams.find("input0___batch")->second;
-        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+    void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis) {
         std::vector <void*> dsts, srcs;
         std::vector <size_t> dpitchs, spitchs, widths, heights;
+        dsts.resize(batch);
+        srcs.resize(batch);
+        dpitchs.resize(batch);
+        spitchs.resize(batch);
+        widths.resize(batch);
+        heights.resize(batch);
+
         for (int b = 0; b < batch; b++) {
             Data &input0 = *input0s[b];
             Data &input1 = *input1s[b];
-            AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                            "Cat's input's type should be float32.\n");
-            AssertInFastLLM(input0.dataDevice == input1.dataDevice,
-                            "CatDirect error: inputs should use same device.\n");
 
             if (input0.dims.size() == 0) {
                 input0.Resize(input1.dims);
@@ -269,30 +267,17 @@ namespace fastllm {
                 int inner = input0.strides[axis];
                 int unitSize = input0.unitSize;
 
-                dsts.push_back(input0.cudaData);
-                dpitchs.push_back(input0Stride * unitSize);
-                srcs.push_back(input1.cudaData);
-                spitchs.push_back(input1Stride * unitSize);
-                widths.push_back(input1.dims[axis] * inner * unitSize);
-                heights.push_back(outer);
+                dsts[b] = (input0.cudaData);
+                dpitchs[b] = (input0Stride * unitSize);
+                srcs[b] = (input1.cudaData);
+                spitchs[b] = (input1Stride * unitSize);
+                widths[b] = (input1.dims[axis] * inner * unitSize);
+                heights[b] = (outer);
                 continue;
             }
 
-            AssertInFastLLM(input0.dims.size() == input1.dims.size(),
-                            "Cat Error: input's shape's size should be same.\n");
-            int dimsLen = input0.dims.size();
-            axis = (axis % dimsLen + dimsLen) % dimsLen;
-
-            for (int i = 0; i < dimsLen; i++) {
-                if (i != axis) {
-                    AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
-                }
-            }
-
-            std::vector<int> dims = input0.dims;
-            std::vector<int> oldDims = dims;
-            dims[axis] += input1.dims[axis];
-            input0.Resize(dims);
+            int oldAxisDims = input0.dims[axis];
+            input0.dims[axis] += input1.dims[axis];
             int outer = input0.Count(0) / input0.Count(axis);
             int input0Stride = input0.Count(axis);
             int input1Stride = input1.Count(axis);
@@ -300,16 +285,41 @@ namespace fastllm {
             int inner = input0.strides[axis];
             int unitSize = input0.unitSize;
 
-            dsts.push_back((uint8_t *) input0.cudaData + oldDims[axis] * inner * unitSize);
-            dpitchs.push_back(input0Stride * unitSize);
-            srcs.push_back(input1.cudaData);
-            spitchs.push_back(input1Stride * unitSize);
-            widths.push_back(inner * unitSize);
-            heights.push_back(outer);
+            dsts[b] = ((uint8_t *) input0.cudaData + oldAxisDims * inner * unitSize);
+            dpitchs[b] = (input0Stride * unitSize);
+            srcs[b] = (input1.cudaData);
+            spitchs[b] = (input1Stride * unitSize);
+            widths[b] = (input1.dims[axis] * inner * unitSize);
+            heights[b] = (outer);
         }
 
         FastllmCudaMemcpy2DDeviceToDeviceBatch(dsts.data(), dpitchs.data(), srcs.data(),
                                                spitchs.data(), widths.data(), heights.data(), dsts.size());
+    }
+
+    void CudaCatDirectBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data **input0s = (Data**)(datas.find("input0")->second);
+        Data **input1s = (Data**)(datas.find("input1")->second);
+        int batch = intParams.find("input0___batch")->second;
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        AssertInFastLLM((input0s[0]->dataType == DataType::FLOAT32 && input1s[0]->dataType == DataType::FLOAT32) ||
+                        (input0s[0]->dataType == DataType::FLOAT16 && input1s[0]->dataType == DataType::FLOAT16) ||
+                        (input0s[0]->dataType == DataType::BFLOAT16 && input1s[0]->dataType == DataType::BFLOAT16),
+                        "Cat's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input0s[0]->dataDevice == input1s[0]->dataDevice,
+                            "CatDirect error: inputs should use same device.\n");
+        AssertInFastLLM(input0s[0]->dims.size() == 0 || input0s[0]->dims.size() == input1s[0]->dims.size(),
+                            "Cat Error: input's shape's size should be same.\n");
+        int dimsLen = input1s[0]->dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        for (int i = 0; i < dimsLen && i < input0s[0]->dims.size(); i++) {
+            if (i != axis) {
+                AssertInFastLLM(input0s[0]->dims[i] == input1s[0]->dims[i], "Cat Error: input's shape doesn't match.");
+            }
+        }
+
+        DoCudaCatDirectBatch(input0s, input1s, batch, axis);
     }
 
     void CudaAppendKVCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -339,6 +349,13 @@ namespace fastllm {
                                                spitchs.data(), widths.data(), heights.data(), dsts.size());
     }
 
+    void DoCudaAttentionBatchReshape(Data **qs, Data **vs, Data **outputs, int batch) {
+        for (int i = 0; i < batch; i++) {
+            outputs[i]->dataType = qs[i]->dataType;
+            outputs[i]->Resize({qs[i]->dims[0], qs[i]->dims[1], vs[i]->dims[2]});
+        }
+    }
+
     void CudaAttentionBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data **qs = (Data**)(datas.find("q")->second);
@@ -356,11 +373,38 @@ namespace fastllm {
         AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
-        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 || q.dataType == DataType::FLOAT16, 
+                    "Attention's input's type should be float32 or float16.\n");
+        DoCudaAttentionBatchReshape(qs, vs, outputs, batch);
+    }
 
+    void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks, Data **outputs, int group, float scale, int batch) {
+        long long aveLen = 0;
         for (int i = 0; i < batch; i++) {
-            outputs[i]->dataType = qs[i]->dataType;
-            outputs[i]->Resize({qs[i]->dims[0], qs[i]->dims[1], vs[i]->dims[2]});
+            aveLen += ks[i]->dims[1];
+        }
+        aveLen /= batch;
+        if (qs[0]->dataType == DataType::FLOAT32 || 
+            true) {
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+            }
+            FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs, group, scale, batch);
+        } else {
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+            }
+            for (int i = 0; i < batch; i++) {
+                if (qs[i]->dataType == DataType::FLOAT16) {
+                    if (masks == nullptr || masks[i] == nullptr) {
+                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], Data(), *outputs[i], group, scale, 0);
+                    } else {
+                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], *masks[i], *outputs[i], group, scale, 0);
+                    }
+                } else {
+                    ErrorInFastLLM("AttentionBatch: datatype should be float32 or float16.");
+                }
+            }
         }
     }
 
@@ -372,12 +416,9 @@ namespace fastllm {
         Data **vs = (Data**)(datas.find("v")->second);
         Data **masks = (Data**)(datas.find("mask")->second);
         Data **outputs = (Data**)(datas.find("output")->second);
-        for (int i = 0; i < batch; i++) {
-            outputs[i]->Allocate();
-        }
-        FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs,
-                                  intParams.find("group")->second,
-                                  floatParams.find("scale")->second,
-                                  intParams.find("q___batch")->second);
+        int group = intParams.find("group")->second;
+        float scale = floatParams.find("scale")->second;
+
+        DoCudaAttentionBatch(qs, ks, vs, masks, outputs, group, scale, batch);
     }
 }

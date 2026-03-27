@@ -9,8 +9,10 @@
 #include "executor.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <cfloat>
+#include <climits>
 #include <thread>
 #include <algorithm>
 
@@ -40,8 +42,27 @@ namespace py = pybind11;
 #endif
 
 #include <mutex>
+
+#include "gguf.h"
+
 namespace fastllm {
-    std::map <std::string, int> defaultDeviceMap;
+    namespace {
+        bool IsEnvValueTrueIgnoreCase(const char *env) {
+            if (env == nullptr) {
+                return false;
+            }
+
+            std::string value(env);
+            for (char &c : value) {
+                if (c >= 'A' && c <= 'Z') {
+                    c = c - 'A' + 'a';
+                }
+            }
+            return value == "1" || value == "on" || value == "true";
+        }
+    }
+
+    std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
 
@@ -50,6 +71,69 @@ namespace fastllm {
     static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
+    static bool historyCacheInCPU = false;
+    static bool cudaEmbedding = false;
+    static bool cudaSharedExpert = false;
+    static bool enableAMX = false;
+    static int maxTokens = -1;
+    static int defaultPageLen = 128;
+    static float gpuMemRatio = 0.9f;
+    static Data emptyData;
+    static FastllmEnv fastllmEnv;
+
+    static std::map <DataType, int> DataTypeBits = {
+        {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
+        {DataType::INT8, 8}, {DataType::INT4, 4}, {DataType::INT2, 2}, {DataType::BIT, 1}, 
+        {DataType::FLOAT16, 16}, {DataType::INT4_NOZERO, 4}, {DataType::INT4_GROUP, 4},
+        {DataType::FP8_E4M3, 8}, {DataType::INT2_GROUP, 2}, {DataType::BASE3_GROUP, 2}
+    };
+
+    FastllmEnv::FastllmEnv() {
+        const char *activateNumaEnv = std::getenv("FASTLLM_ACTIVATE_NUMA");
+        std::string activateNumaValue = activateNumaEnv ? activateNumaEnv : "";
+        this->activateNuma = !activateNumaValue.empty() && activateNumaValue != "OFF";
+
+        const char *numaThreadsEnv = std::getenv("FASTLLM_NUMA_THREADS");
+        if (numaThreadsEnv != nullptr) {
+            int value = atoi(numaThreadsEnv);
+            if (value > 0) {
+                this->numaThreads = value;
+            }
+        }
+
+        const char *numasEnv = std::getenv("FASTLLM_NUMAS");
+        if (numasEnv != nullptr) {
+            int value = atoi(numasEnv);
+            if (value > 0) {
+                this->numas = value;
+            }
+        }
+
+        const char *cudaSyncEnv = std::getenv("FASTLLM_CUDA_SYNC");
+        this->cudaSync = cudaSyncEnv != nullptr && std::strcmp(cudaSyncEnv, "1") == 0;
+
+        this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
+        this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
+
+        const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
+        if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {
+            this->useFusedTransferAttn = false;
+        }
+
+        const char *useFusedGdnPrefillEnv = std::getenv("FASTLLM_USE_FUSED_GDN_PREFILL");
+        if (useFusedGdnPrefillEnv != nullptr && std::strcmp(useFusedGdnPrefillEnv, "0") == 0) {
+            this->useFusedGdnPrefill = false;
+        }
+
+        const char *debugTokenIdEnv = std::getenv("FASTLLM_DEBUG_TOKEN_ID");
+        if (debugTokenIdEnv != nullptr) {
+            this->debugTokenId = debugTokenIdEnv;
+        }
+    }
+
+    const FastllmEnv &GetFastllmEnv() {
+        return fastllmEnv;
+    }
 
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
@@ -75,8 +159,32 @@ namespace fastllm {
         printf("Neon DOT: %s\n", neonDot.c_str());
     }
 
+    Data *GetEmptyData() {
+        return &emptyData;
+    }
+
+    void SetCudaEmbedding(bool v) {
+        cudaEmbedding = v;
+    }
+
+    bool GetCudaEmbedding() {
+        return cudaEmbedding;
+    }
+
+    void SetCudaSharedExpert(bool v) {
+        cudaSharedExpert = v;
+    }
+
+    bool GetCudaSharedExpert() {
+        return cudaSharedExpert;
+    }
+
     void SetKVCacheInCPU(bool v) {
         kvCacheInCPU = v;
+    }
+
+    void SetHistoryCacheInCPU(bool v) {
+        historyCacheInCPU = v;
     }
 
     void SetAliveThreads(int t) {
@@ -84,18 +192,17 @@ namespace fastllm {
         py::gil_scoped_release release;
 #endif
         globalLocker.lock();
-        threads = t;
         if (fastllmAliveThreadPool != nullptr) {
-            fastllmAliveThreadPool->Shutdown();
-            delete fastllmAliveThreadPool;
+            fastllmAliveThreadPool->ResizeThreads(t);
+        } else {
+            fastllmAliveThreadPool = new AliveThreadPool(t);
         }
-        fastllmAliveThreadPool = new AliveThreadPool(t);
+        threads = fastllmAliveThreadPool->threads.size();
         globalLocker.unlock();
 #ifdef PY_API
         py::gil_scoped_acquire acquire;
 #endif
     }
-
     void SetThreads(int t) {
         SetAliveThreads(t);
     }
@@ -108,6 +215,10 @@ namespace fastllm {
         return kvCacheInCPU;
     }
 
+    bool GetHistoryCacheInCPU() {
+        return historyCacheInCPU;
+    }
+
     bool GetLowMemMode() {
         return lowMemMode;
     }
@@ -116,11 +227,114 @@ namespace fastllm {
         return threads;
     }
 
+    extern void InitAMX();
+    void EnableAMX(bool enable) {
+        enableAMX = enable;
+        if (enable) {
+            InitAMX();
+        }
+    }
+
+    bool GetEnableAMX() {
+        return enableAMX;
+    }
+
+    void SetMaxTokens(int tokens) {
+        maxTokens = tokens;
+    }
+
+    int GetMaxTokens() {
+        return maxTokens;
+    }
+
+    void SetPageLen(int pageLen) {
+        defaultPageLen = pageLen;
+    }
+
+    int GetPageLen() {
+        return defaultPageLen;
+    }
+
+    void SetGpuMemRatio(float ratio) {
+        gpuMemRatio = ratio;
+    }
+
+    float GetGpuMemRatio() {
+        return gpuMemRatio;
+    }
+
     AliveThreadPool *GetAlivePool() {
         if (fastllmAliveThreadPool == nullptr) {
             SetAliveThreads(threads);
         }
         return fastllmAliveThreadPool;
+    }
+
+    std::map <DataType, std::vector <std::string> > dataTypeNames = {
+        {DataType::FLOAT32, {"float32", "fp32"}}, {DataType::BFLOAT16, {"bfloat16", "bf16"}}, {DataType::INT16, {"int16"}}, 
+        {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
+        {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
+        {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
+        {DataType::INT32, {"int32"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
+        {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
+        {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
+        {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
+        {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
+        {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}}
+    };
+
+    std::string GetDataTypeName(DataType type) {
+        if (dataTypeNames.find(type) != dataTypeNames.end()) {
+            return dataTypeNames[type][0];
+        } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
+            return "GGML Type " + std::string(ggml_type_name((ggml_type)((int)type - (int)DataType::DATA_GGUF_FORMAT)));
+        } else {
+            return "Type " + std::to_string((int)type);
+        }
+    }
+
+    size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
+        if (type == DataType::FLOAT32) {
+            return rows * columns * sizeof(float);
+        } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
+            return rows * columns * sizeof(uint16_t);
+        } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP) {
+            return rows * (columns / 2);
+        } else if (type == DataType::INT8) {
+            return rows * columns;
+        } else if (type == DataType::FP8_E4M3_BLOCK_128) {
+            // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
+            return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
+        } else if (type == DataType::FP8_E4M3_PERCHANNEL) {
+            return rows * (columns + sizeof(float));
+        } else if (type == DataType::FP8_E4M3) {
+            return rows * columns * sizeof(uint8_t);
+        } else if (type == DataType::INT4_PERCHANNEL) {
+            return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::INT8_PERCHANNEL) {
+            return rows * (columns + 2 * sizeof(float));
+        } else if (type == DataType::INT4_GROUP128) {
+            rows *= (columns / 128);
+            columns = 128;
+            return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::AWQ_4BIT_128) {
+            int groups = (columns - 1) / 128 + 1;
+            size_t colBytes = columns / 2 + groups + groups * sizeof(float);
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_PERCHANNEL) {
+            size_t colBytes = columns + sizeof(float) + sizeof(int); // [int8 values] + scale + sum
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_GROUP128) {
+            size_t colBytes = (columns / 128) * (128 + sizeof(float) + sizeof(int)); // [int8 values] + scale + sum
+            return rows * colBytes;
+        } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
+            size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
+            return rows * colBytes;
+        } else {
+            ErrorInFastLLM("GetDataBytes failed. " + GetDataTypeName(type) + "\n");
+            return 0;
+        }
     }
     
 #ifdef USE_MMAP
@@ -173,6 +387,70 @@ namespace fastllm {
         ptr += bytes;
         return buffer;
     }
+
+    struct ByteReader {
+        uint8_t *cur;
+
+        ByteReader (uint8_t *data) {
+            this->cur = data;
+        }
+
+        int ReadInt() {
+            int ret = *((int*)cur);
+            cur += sizeof(int);
+            return ret;
+        }
+
+        float ReadFloat() {
+            float ret = *((float*)cur);
+            cur += sizeof(float);
+            return ret;
+        }
+
+        std::string ReadString() {
+            int len = ReadInt();
+            std::string ret = "";
+            char *v = new char[len + 5];
+            v[len] = 0;
+            memcpy(v, cur, len);
+            cur += len;
+            return v;
+        }
+
+        void ReadBytes(uint8_t *buffer, uint64_t bytes) {
+            memcpy(buffer, cur, bytes);
+            cur += bytes;
+        }
+    };
+
+    struct ByteWriter {
+        uint8_t *cur;
+
+        ByteWriter (uint8_t *data) {
+            this->cur = data;
+        }
+
+        void WriteInt(int v) {
+            *((int*)cur) = v;
+            cur += sizeof(int);
+        }
+
+        void WriteFloat(float v) {
+            *((float*)cur) = v;
+            cur += sizeof(float);
+        }
+
+        void WriteString(const std::string &s) {
+            WriteInt((int)s.size());
+            memcpy(cur, s.data(), s.size());
+            cur += s.size();
+        }
+
+        void WriteBytes(uint8_t *buffer, uint64_t bytes) {
+            memcpy(cur, buffer, bytes);
+            cur += bytes;
+        }
+    };
 
     struct FileBuffer {
         FILE *f;
@@ -266,6 +544,29 @@ namespace fastllm {
         Resize(dims);
     }
 
+    Data::Data(fastllm::DataType type, int ggmlType, const std::vector <int> &dims) {
+        this->dataType = type;
+        this->ggmlType = (ggml_type)ggmlType;
+        Resize(dims);
+    }
+
+    Data::Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr): Data::Data(type, dims) {
+        this->isFake = true;
+        this->expansionSize = this->Count(0);
+        this->UpdateUnitSize();
+        this->dataDevice = device;
+        if (device == DataDevice::CPU) {
+            this->cpuData = (uint8_t*)ptr;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            this->cudaData = ptr;
+            this->dataDeviceIds = {0}; // todo 支持多卡
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        }
+    }
+
     Data::Data(fastllm::DataType type, const std::vector<int> &dims, const std::vector<float> &data) : Data::Data(type, dims) {
         // std::cout<<"调用数值构造"<<std::endl;
         this->Allocate();
@@ -280,6 +581,7 @@ namespace fastllm {
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
         this->dataType = ori.dataType;
+        this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
         if (this->dataDevice == DataDevice::CPU) {
@@ -294,54 +596,57 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
+        this->isLinearAttention = ori.isLinearAttention;
         this->cacheUid = ori.cacheUid;
+        this->dataDevice = ori.dataDevice;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (ori.expansionDims != this->expansionDims || ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
-                delete[] this->cpuData;
                 this->dataType = ori.dataType;
                 this->UpdateUnitSize();
                 this->dims.resize(0);
-                this->cpuData = nullptr;
+
+                if (this->dataDevice == DataDevice::CPU) {
+                    delete[] this->cpuData;
+                    this->cpuData = nullptr;
+                } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                    FastllmCudaFree(this->cudaData);
+                    this->cudaData = nullptr;
+#endif
+                }
                 return;
             }
             this->dataType = ori.dataType;
+            this->UpdateUnitSize();
             if (ori.expansionDims.size() > 0 && ori.expansionDims != ori.dims) {
                 this->Expansion(ori.expansionDims);
                 this->Resize(ori.dims);
                 this->Allocate();
             } else {
+                this->expansionDims.clear();
                 this->Resize(ori.dims);
-                this->Allocate();
+                this->FreeSpace();
+                this->MallocSpace(Count(0));
             }
         }
-        std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+
+        if (this->dataDevice == DataDevice::CPU) {
+            std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+#endif
+        }
     }
 
-    struct BF16ToFP16Manager {
-        float dict[65536];
+    BF16ToFP16Manager bf16tofp16;
 
-        BF16ToFP16Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                uint32_t x = (i << 16);
-                dict[i] = float_to_half(*((float*)&x));
-            }
-        }
-    } bf16tofp16;
-
-    struct BF16ToFP32Manager {
-        float dict[65536];
-
-        BF16ToFP32Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                uint32_t x = (i << 16);
-                dict[i] = *((float*)&x);
-            }
-        }
-    } bf16tofp32;
+    extern BF16ToFP32Manager bf16tofp32;
 
     struct MultiThreadGroupQuantizationBF16Op : MultiThreadBaseOp {
         int st, end, m;
@@ -356,7 +661,7 @@ namespace fastllm {
                                         st(st), end(end), m(m), bf(bf), u8(u8), configs(configs), bit(bit), group(group), groupCnt(groupCnt) {}
         
         void Run() {
-            int type = (bit == 4) ? 1 : 0;
+            int type = (bit == 4 || bit == 2) ? 1 : 0;
             for (int i = st; i < end; i++) {
                 for (int g = 0; g < group; g++) {
                     int cid = i * group + g;
@@ -373,7 +678,7 @@ namespace fastllm {
                         for (int j = groupStart; j < groupEnd; j++) {
                             u8[i * m + j] = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j]]);
                         }
-                    } else {
+                    } else if (bit == 4) {
                         configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
                         for (int j = groupStart; j < groupEnd; j++) {
                             int id = (i * m + j) / 2;
@@ -383,6 +688,16 @@ namespace fastllm {
                             } else {
                                 u8[id] = (u8[id] & 0xF) | (value << 4);
                             }
+                        }
+                    } else if (bit == 2) {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 2, type);
+                        for (int j = groupStart; j + 3 < groupEnd; j += 4) {
+                            int id = (i * m + j) / 4;
+                            uint8_t value0 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 0]]);
+                            uint8_t value1 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 1]]);
+                            uint8_t value2 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 2]]);
+                            uint8_t value3 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 3]]);
+                            u8[id] = (value0 << 6) | (value1 << 4) | (value2 << 2) | (value3);
                         }
                     }
                 }
@@ -403,7 +718,7 @@ namespace fastllm {
                                         st(st), end(end), m(m), f(f), u8(u8), configs(configs), bit(bit), group(group), groupCnt(groupCnt) {}
         
         void Run() {
-            int type = (bit == 4) ? 1 : 0;
+            int type = (bit == 4 || bit == 2) ? 1 : 0;
             for (int i = st; i < end; i++) {
                 for (int g = 0; g < group; g++) {
                     int cid = i * group + g;
@@ -420,7 +735,7 @@ namespace fastllm {
                         for (int j = groupStart; j < groupEnd; j++) {
                             u8[i * m + j] = configs[cid].quantization(f[i * m + j]);
                         }
-                    } else {
+                    } else if (bit == 4) {
                         configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
                         for (int j = groupStart; j < groupEnd; j++) {
                             int id = (i * m + j) / 2;
@@ -431,6 +746,100 @@ namespace fastllm {
                                 u8[id] = (u8[id] & 0xF) | (value << 4);
                             }
                         }
+                    } else if (bit == 2) {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 2, type);
+                        for (int j = groupStart; j + 3 < groupEnd; j += 4) {
+                            int id = (i * m + j) / 4;
+                            uint8_t value0 = configs[cid].quantization(f[i * m + j + 0]);
+                            uint8_t value1 = configs[cid].quantization(f[i * m + j + 1]);
+                            uint8_t value2 = configs[cid].quantization(f[i * m + j + 2]);
+                            uint8_t value3 = configs[cid].quantization(f[i * m + j + 3]);
+                            u8[id] = (value0 << 6) | (value1 << 4) | (value2 << 2) | (value3);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    struct MultiThreadBase3GroupQuantizationOp : MultiThreadBaseOp {
+        int st, end, m;
+        float *f32;
+        uint8_t *u8;
+        uint16_t *halfScales;
+        int group, groupCnt;
+
+        MultiThreadBase3GroupQuantizationOp (int st, int end, int m,
+                                        float *f32, uint8_t *u8, uint16_t *halfScales, int group, int groupCnt) :
+                                        st(st), end(end), m(m), f32(f32), u8(u8), halfScales(halfScales), group(group), groupCnt(groupCnt) {}
+        
+        void Run() {
+            std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            for (int i = st; i < end; i++) {
+                for (int g = 0; g < group; g++) {
+                    uint8_t *cur = u8 + i * group * bytesPerGroup + g * bytesPerGroup;
+                    int cid = i * group + g;
+                    int groupStart = g * groupCnt;
+                    int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                    float minValue = 1e9, maxValue = -1e9, mean = 0.0;
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        minValue = std::min(minValue, f32[i * m + j]);
+                        maxValue = std::max(maxValue, f32[i * m + j]);
+                        mean += fabs(f32[i * m + j]);
+                    }
+                    mean = std::max(1e-5f, mean / (groupEnd - groupStart));
+                    float scale = mean;
+                    halfScales[i * group + g] = float_to_half(scale);
+
+                    memcpy(cur, cur + bytesPerGroup, 0);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        float now = f32[i * m + j];
+                        uint8_t curV = (now > -scale * 0.5) + (now > scale * 0.5);
+                        cur[(j - groupStart) / 5] += curV * base[(j - groupStart) % 5];
+                    }
+                }
+            }
+        }
+    };
+
+    struct MultiThreadBase3GroupQuantizationBF16Op : MultiThreadBaseOp {
+        int st, end, m;
+        uint16_t *bf;
+        uint8_t *u8;
+        uint16_t *halfScales;
+        int group, groupCnt;
+
+        MultiThreadBase3GroupQuantizationBF16Op (int st, int end, int m,
+                                        uint16_t *bf, uint8_t *u8, uint16_t *halfScales, int group, int groupCnt) :
+                                        st(st), end(end), m(m), bf(bf), u8(u8), halfScales(halfScales), group(group), groupCnt(groupCnt) {}
+        
+        void Run() {
+            std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            for (int i = st; i < end; i++) {
+                for (int g = 0; g < group; g++) {
+                    uint8_t *cur = u8 + i * group * bytesPerGroup + g * bytesPerGroup;
+                    int cid = i * group + g;
+                    int groupStart = g * groupCnt;
+                    int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                    float minValue = 1e9, maxValue = -1e9, mean = 0.0;
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        minValue = std::min(minValue, bf16tofp32.dict[bf[i * m + j]]);
+                        maxValue = std::max(maxValue, bf16tofp32.dict[bf[i * m + j]]);
+                        mean += fabs(bf16tofp32.dict[bf[i * m + j]]);
+                    }
+                    mean = std::max(1e-5f, mean / (groupEnd - groupStart));
+                    float scale = mean;
+                    halfScales[i * group + g] = float_to_half(scale);
+
+                    memcpy(cur, cur + bytesPerGroup, 0);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        float now = bf16tofp32.dict[bf[i * m + j]];
+                        uint8_t curV = (now > -scale * 0.5) + (now > scale * 0.5);
+                        cur[(j - groupStart) / 5] += curV * base[(j - groupStart) % 5];
                     }
                 }
             }
@@ -517,13 +926,39 @@ namespace fastllm {
         }
     };
 
-    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, int groupCnt) {
+    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, 
+            int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
         data.UpdateUnitSize();
         data.Allocate();
         if (dataType == oriDataType) {
-            memcpy(data.cpuData, oriData, data.GetBytes());
+            if (oriData != nullptr) {
+                memcpy(data.cpuData, oriData, data.GetBytes());
+            } 
+            if (dataType == DataType::INT4_GROUP) {
+                int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
+                this->group = group;
+                this->groupCnt = groupCnt;
+                data.mins.resize(k * group);
+                data.scales.resize(k * group);
+                memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
+                memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
+                data.perChannelAxis = 0;
+                /* data.perChannelsConfigs.resize(k * group);
+                for (int i = 0; i < k * group; i++) {
+                    data.perChannelsConfigs[i] = LowBitConfig(data.mins[i], data.mins[i] + 15 * data.scales[i], 4, 1);
+                    data.perChannelsConfigs[i].min = data.mins[i];
+                    data.perChannelsConfigs[i].scale = data.scales[i];
+                } */
+            } else if (dataType == DataType::FP8_E4M3) {
+                this->blockK = blockK;
+                this->blockM = blockM;
+                int ks = (this->dims[0] - 1) / this->blockK + 1;
+                int ms = (this->dims[1] - 1) / this->blockM + 1;
+                data.scales.resize(ks * ms);
+                memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
+            }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
             uint16_t *a = (uint16_t*)data.cpuData;
@@ -564,17 +999,17 @@ namespace fastllm {
                 (MultiThreadGroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
             }
             data.perChannelAxis = 0;
-            data.perChannelsConfigs.resize(k * group);
+            // data.perChannelsConfigs.resize(k * group);
             data.group = group;
             data.groupCnt = groupCnt;
-            data.zeros.resize(k * group);
+            // data.zeros.resize(k * group);
             data.scales.resize(k * group);
             data.mins.resize(k * group);
             for (int i = 0; i < k * group; i++) {
-                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit, type);
-                data.mins[i] = data.perChannelsConfigs[i].min;
-                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
-                data.scales[i] = data.perChannelsConfigs[i].scale;
+                auto config = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = config.min;
+                // data.zeros[i] = config.zeroPoint;
+                data.scales[i] = config.scale;
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16) &&
@@ -608,12 +1043,82 @@ namespace fastllm {
                 data.scales[i] = data.perChannelsConfigs[i].scale;
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16) &&
+                (dataType == DataType::BASE3_GROUP)) {
+            int k = data.dims[0], m = data.dims[1];
+            if (groupCnt == -1) {
+                groupCnt = 128;
+            }
+            int group = (m - 1) / groupCnt + 1;
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            std::vector<uint16_t> scales;
+            std::vector<uint8_t> uDatas;
+            scales.resize(k * group);
+            int bytes = k * group * bytesPerGroup;
+            uDatas.resize(bytes);
+            data.group = group;
+            data.groupCnt = groupCnt;
+            data.halfScales.resize(k * group);
+
+            if (oriDataType == DataType::FLOAT32) {
+               (MultiThreadBase3GroupQuantizationOp(0, k, m, (float*)oriData, uDatas.data(), data.halfScales.data(), group, groupCnt)).Run();
+            } else if (oriDataType == DataType::BFLOAT16) {
+               (MultiThreadBase3GroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), data.halfScales.data(), group, groupCnt)).Run();
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
+                && dataType == DataType::INT2_GROUP) {
+            int bit = 2;
+            int type = 1;
+            int k = data.dims[0], m = data.dims[1];
+            if (groupCnt == -1) {
+                groupCnt = 32;
+            }
+            int group = (m - 1) / groupCnt + 1;
+            std::vector<LowBitConfig> configs;
+            std::vector<uint8_t> uDatas;
+            configs.resize(k * group);
+
+            int bytes = k * m / 4;
+            uDatas.resize(bytes);
+            if (oriDataType == DataType::FLOAT32) {
+                (MultiThreadGroupQuantizationOp(0, k, m, (float*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
+            } else if (oriDataType == DataType::BFLOAT16) {
+                (MultiThreadGroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
+            }
+            data.perChannelAxis = 0;
+            data.group = group;
+            data.groupCnt = groupCnt;
+            data.scales.resize(k * group);
+            data.mins.resize(k * group);
+            for (int i = 0; i < k * group; i++) {
+                auto config = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = config.min;
+                data.scales[i] = config.scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if (oriDataType == DataType::FLOAT32 && dataType == DATA_GGUF_FORMAT) {
+            uint8_t *a = (uint8_t*)data.cpuData;
+            float *b = (float*)oriData;
+            int len = data.dims[0] * data.dims[1];
+
+            auto from_float = ggml_type_from_float_ref((ggml_type)data.ggmlType);
+            if (from_float == nullptr) {
+                printf("Failed to find convert function for %s\n", ggml_type_name((ggml_type)data.ggmlType));
+                exit(0);
+            }
+            from_float (
+                b, a, len
+            );
         } else {
-            ErrorInFastLLM("wrong data type");
+            ErrorInFastLLM("wrong data type " + dataTypeNames[oriDataType][0] + " -> " + dataTypeNames[dataType][0]);
         }
     }
 
     uint64_t Data::Count(int i) const {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT && i == 0) {
+            return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
+        }
         if (i >= this->dims.size()) {
             return 1;
         }
@@ -632,7 +1137,7 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8) {
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
@@ -640,14 +1145,19 @@ namespace fastllm {
                 || this->dataType == DataType::INT4_GROUP) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
-        } else if (this->dataType == DataType::INT2) {
+        } else if (this->dataType == DataType::INT2
+                || this->dataType == DataType::INT2_GROUP) {
             this->unitSize = 1;
             this->unitSizeDiv = 4;
         } else if (this->dataType == DataType::BIT) {
             this->unitSize = 1;
             this->unitSizeDiv = 8;
-        } else if (this->dataType == DataType::INT32PARAM) {
+        } else if (this->dataType == DataType::INT32PARAM || this->dataType == DataType::INT32) {
             this->unitSize = 4;
+            this->unitSizeDiv = 1;
+        } else if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            // 用GGUF的函数来计算长度
+            this->unitSize = 1;
             this->unitSizeDiv = 1;
         }
 
@@ -657,6 +1167,34 @@ namespace fastllm {
     void Data::Resize(const std::vector<int> &dims) {
         this->dims = dims;
         this->UpdateUnitSize();
+
+        if (this->dataType == DATA_GGUF_FORMAT) {
+            std::vector <int> cur = dims;
+            std::reverse(cur.begin(), cur.end());
+
+            if (this->ggmlTensor == nullptr) {
+                this->ggmlTensor = new ggml_tensor();
+            }
+            ggml_tensor* tensor = (ggml_tensor*)this->ggmlTensor;
+            tensor->type = (ggml_type)this->ggmlType;
+            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                tensor->ne[j] = 1;
+                if (j < cur.size()) {
+                    tensor->ne[j] = cur[j];
+                }
+            }
+
+            {
+                tensor->type = (ggml_type)this->ggmlType;
+                const size_t  type_size = ggml_type_size(tensor->type);
+                const int64_t blck_size = ggml_blck_size(tensor->type);
+                tensor->nb[0] = type_size;
+                tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / blck_size);
+                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                    tensor->nb[j] = tensor->nb[j - 1] * tensor->ne[j - 1];
+                }
+            }
+        }
 
         if (this->expansionDims.size() == 0) {
             this->strides.resize(dims.size(), 1);
@@ -701,6 +1239,13 @@ namespace fastllm {
     }
 
     uint64_t Data::GetBytes() const {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
+        }
+        if (this->dataType >= 1000 && this->dataType < DataType::DATA_GGUF_FORMAT 
+            && this->dims.size() == 2) {
+            return GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+        }
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
@@ -717,6 +1262,16 @@ namespace fastllm {
             } else {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
+            if (this->cudaData == nullptr) {
+                ErrorInFastLLM("Error: cuda malloc failed in Data::MallocSpace, maybe no enough GPU memory.\n");
+            }
+            if (this->multiDeviceData) {
+                for (auto it : this->multiDeviceDatas) {
+                    delete it.second;
+                }
+                this->multiDeviceData = false;
+            }
+            FastllmCudaMemset0(this->cudaData, this->expansionBytes);
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -724,10 +1279,18 @@ namespace fastllm {
     }
 
     void Data::FreeSpace() {
+        if (isFake)
+            return;
         this->expansionSize = 0;
         this->expansionBytes = 0;
         if (this->dataDevice == DataDevice::CPU) {
+#ifdef USE_MMAP
+            if (this->name.empty())
+                delete[] this->cpuData;
+#else
             delete[] this->cpuData;
+#endif
+            this->cpuData = nullptr;
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             if (this->directMemory) {
@@ -735,6 +1298,7 @@ namespace fastllm {
             } else {
                 FastllmCudaFree(this->cudaData);
             }
+            this->cudaData = nullptr;
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -750,7 +1314,8 @@ namespace fastllm {
 
     void Data::Allocate(float v) {
         AssertInFastLLM(this->dataType == DataType::FLOAT32
-                        || this->dataType == DataType::FLOAT16, "Allocate error: Data's type should be float32 or float16.\n");
+                        || this->dataType == DataType::FLOAT16
+                        || this->dataType == DataType::BFLOAT16, "Allocate error: Data's type should be float32, float16 or bfloat16.\n");
         this->Allocate();
         if (this->dataDevice == DataDevice::CPU) {
             if (this->dataType == DataType::FLOAT32) {
@@ -759,6 +1324,10 @@ namespace fastllm {
             } else if (this->dataType == DataType::FLOAT16) {
                 uint16_t *h = (uint16_t*)cpuData;
                 std::fill(h, h + Count(0), float_to_half(v));
+            } else if (this->dataType == DataType::BFLOAT16) {
+                uint16_t *h = (uint16_t*)cpuData;
+                uint16_t bf16v = (uint16_t)(*((uint32_t*)&v) >> 16);
+                std::fill(h, h + Count(0), bf16v);
             }
         } if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
@@ -767,6 +1336,10 @@ namespace fastllm {
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
             } else if (this->dataType == DataType::FLOAT16) {
                 std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), float_to_half(v));
+                FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
+            } else if (this->dataType == DataType::BFLOAT16) {
+                uint16_t bf16v = (uint16_t)(*((uint32_t*)&v) >> 16);
+                std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), bf16v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
             }
 #endif
@@ -846,20 +1419,31 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (this->isPagedKVCache && !this->pageIndex.empty()) {
+            this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
+        }
+        if (this->multiDeviceData) {
+            for (auto it : this->multiDeviceDatas) {
+                delete it.second;
+            }
+        }
         if (isFake) {
             return;
         }
-#ifndef USE_MMAP
-        delete[] this->cpuData;
+        if (this->cpuData != nullptr)
+#ifdef USE_MMAP
+            if (this->name.empty())
+                delete[] this->cpuData;
+#else
+           delete[] this->cpuData;
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            FastllmCudaFree(this->cudaData);
-            /*if (this->directMemory) {
+            if (this->directMemory) {
                 FastllmCudaDirectFree(this->cudaData);
             } else {
                 FastllmCudaFree(this->cudaData);
-            }*/
+            }
         }
 #endif
     }
@@ -877,6 +1461,7 @@ namespace fastllm {
     }
 
     void Data::Print() const {
+        ((Data*)this)->ToDevice(DataDevice::CPU);
         printf("shape: ");
         for (int i : this->dims) {
             printf("%d ", i);
@@ -907,6 +1492,14 @@ namespace fastllm {
         } else if (this->dataType == DataType::FLOAT16) {
             for (int i = 0; i < floatData.size(); i++) {
                 floatData[i] = half_to_float(((uint16_t*)cpuData)[i]);
+            }
+        } else if (this->dataType == DataType::BFLOAT16) {
+            for (int i = 0; i < floatData.size(); i++) {
+                floatData[i] = bf16tofp32.dict[(((uint16_t*)cpuData)[i])];
+            }
+        } else if (this->dataType == DataType::INT32) {
+            for (int i = 0; i < floatData.size(); i++) {
+                floatData[i] = ((int32_t*)cpuData)[i];
             }
         }
 
@@ -1040,11 +1633,11 @@ namespace fastllm {
                     }
                     weightSum[gid] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
-#ifdef __AVX2__X
+#ifdef __AVX2__
                     __m256i acc = _mm256_setzero_si256();
                     const __m256i lowMask = _mm256_set1_epi8(0xf);
                     const __m256i ones = _mm256_set1_epi16(1);
-                    for (; j + 31 < m; j += 32) {
+                    for (; j + 31 < end; j += 32) {
                         __m128i orix = _mm_loadu_si128((const __m128i *) (cpuData + (i * m + j) / 2));
                         __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
                         __m256i bx = _mm256_and_si256(lowMask, bytex);
@@ -1055,7 +1648,7 @@ namespace fastllm {
                         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
                         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
                     }
-                    weightSum[i] += I32sum(acc);
+                    weightSum[gid] += I32sum(acc);
 #endif
                     for (; j + 1 < end; j += 2) {
                         int id = (i * m + j) / 2;
@@ -1074,24 +1667,28 @@ namespace fastllm {
         } 
     }
 
-    void Data::ToDevice(void *device) {
+    void Data::ToDevice(void *device, bool copyData) {
         BaseDevice *dev = (BaseDevice*)device;
-        if (dev->deviceType == "cuda") {
-            this->ToDevice(DataDevice::CUDA, dev->deviceIds);
+        if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
+            this->ToDevice(DataDevice::CUDA, dev->deviceIds, copyData);
         } else {
-            this->ToDevice(DataDevice::CPU, dev->deviceIds);
+            this->ToDevice(DataDevice::CPU, dev->deviceIds, copyData);
         }
     }
 
-    void Data::ToDevice(fastllm::DataDevice device) {
+    void Data::ToDevice(fastllm::DataDevice device, bool copyData) {
         if (device == DataDevice::CUDA) {
-            ToDevice(device, curExecutor->GetDeviceIds("cuda"));
+            ToDevice(device, curExecutor->GetDeviceIds("cuda"), copyData);
         } else {
-            ToDevice(device, {0});
+#ifdef USE_CUDA
+            ToDevice(device, {FastllmCudaGetDevice()}, copyData);
+#else
+            ToDevice(device, {0}, copyData);
+#endif
         }
     }
 
-    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds) {
+    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds, bool copyData) {
         // TODO: 同一个Weight切分到不同 Device 上
         // NOTICE: 目前还不支持，暂时只切到deviceIds[0]上
 
@@ -1111,53 +1708,400 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
-                    uint8_t *cpuData = this->cpuData;
+                    int destDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
+                    FastllmCudaSetDevice(destDevice);
+                    if (this->cudaData != nullptr) {
+                        bool needRealloc = true;
+                        int ptrDevice = GetPointerDeviceId(this->cudaData);
+                        if (ptrDevice >= 0) {
+                            needRealloc = (ptrDevice != destDevice);
+                        }
+                        if (needRealloc) {
+                            FastllmCudaFree(this->cudaData);
+                            this->cudaData = nullptr;
+                        }
+                    }
+                    if (copyData) {
+                        uint8_t *cpuData = this->cpuData;
 #ifdef USE_MMAP
-                    cpuData = new uint8_t[expansionBytes];
-                    memcpy(cpuData, this->cpuData, expansionBytes);
+                        cpuData = new uint8_t[expansionBytes];
+                        memcpy(cpuData, this->cpuData, expansionBytes);
 #endif
-                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
-                    this->cudaData = FastllmCudaMalloc(expansionBytes);
-                    FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                        if (this->cudaData == nullptr) {
+                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                        }
+
+                        FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
 #ifdef USE_MMAP
-                    delete[] cpuData;
+                        delete[] cpuData;
 #else
-                    delete[] this->cpuData;
-                    this->cpuData = nullptr;
+                        if (this->isModelWeight || this->isKVCache) {
+                            delete[] this->cpuData;
+                            this->cpuData = nullptr;
+                        }
 #endif
+                    } else {
+                        if (this->cudaData == nullptr) {
+                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                        }
+                    }
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
-                    this->cpuData = new uint8_t[expansionBytes];
-                    FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
-                    FastllmCudaFree(this->cudaData);
-                    this->cudaData = nullptr;
+                    if (this->cpuData == nullptr) {
+                        this->cpuData = new uint8_t[expansionBytes];
+                    }
+                    if (copyData) {
+                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                    }
+
+                    if (this->isModelWeight || this->isKVCache) {
+                        FastllmCudaFree(this->cudaData);
+                        this->cudaData = nullptr;
+                    }
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
+                    if (this->cudaData != nullptr) {
+                        int realSourceDevice = GetPointerDeviceId(this->cudaData);
+                        if (realSourceDevice >= 0) {
+                            sourceDevice = realSourceDevice;
+                        }
+                    }
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
-                    FastllmCudaSetDevice(destDevice);
-                    void *newCudaData = FastllmCudaMalloc(expansionBytes);
-
-                    FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
-                    FastllmCudaSetDevice(sourceDevice);
-                    FastllmCudaFree(this->cudaData);
-                    this->cudaData = newCudaData;
-                    FastllmCudaSetDevice(destDevice);
+                    if (sourceDevice != destDevice) {
+                                        FastllmCudaSetDevice(destDevice);
+                                        void *newCudaData = FastllmCudaMalloc(expansionBytes);
+                                        if (copyData) {
+                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                        }
+                                        FastllmCudaSetDevice(sourceDevice);
+                                        FastllmCudaFree(this->cudaData);
+                                        this->cudaData = newCudaData;
+                                        FastllmCudaSetDevice(destDevice);
+                    }
                 }
             }
 #endif
         }
         if (deviceIds.size() == 0) {
+#ifdef USE_CUDA
+            this->dataDeviceIds = {FastllmCudaGetDevice()};
+#else
             this->dataDeviceIds = {0};
+#endif
         } else {
             this->dataDeviceIds = deviceIds;
         };
         this->dataDevice = device;
     }
 
+    // 临时移动到cuda 
+    void Data::ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData, void *stream) { 
+#ifdef USE_CUDA
+        AssertInFastLLM(deviceIds.size() <= 0, "ToCudaTemporary Error: can't set deviceids\n");
+        this->dataDevice = DataDevice::CUDA;
+        size_t bytes = this->GetBytes();
+
+        if (this->cudaData == nullptr) {
+            this->cudaData = (uint8_t*)FastllmCudaMalloc(bytes);
+        }
+
+        if (copyData) {
+            if (this->cpuData != nullptr) {
+                if (stream) {
+                    if (this->isPinned) {
+                        FastllmCudaCopyFromPinnedHostToDeviceAsync(this->cudaData, this->cpuData, bytes, stream);
+                    } else {
+                        FastllmCudaCopyFromHostToDeviceAsync(this->cudaData, this->cpuData, bytes, stream);
+                    }
+                } else {
+                    if (this->isPinned) {
+                        FastllmCudaCopyFromPinnedHostToDevice(this->cudaData, this->cpuData, bytes);
+                    } else {
+                        FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+                    }
+                }
+            } else {
+                int numaCnt = this->numasData.size();
+                int k = this->dims[0], m = this->dims[1];
+                int kPerNuma = k / numaCnt;
+                size_t bytesPerRow = GetDataBytes(this->dataType, 1, m);
+                if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+                    bytesPerRow = GetDataBytes((DataType)((int)this->dataType + this->ggmlType), 1, m);
+                }
+                if (stream) {
+                    if (this->isPinned) {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromPinnedHostToDeviceAsync((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow, stream);
+                        }
+                    } else {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromHostToDeviceAsync((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow, stream);
+                        }
+                    }
+                } else {
+                    if (this->isPinned) {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromPinnedHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                        }
+                    } else {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                        }
+                    }
+                }
+            }
+        }
+#else
+        ErrorInFastLLM("ToCudaTemporary Error: don't support.");
+#endif
+    }
+
+    // 销毁临时移动到cuda的数据
+    void Data::FreeCudaTemporary(const std::vector <int> &deviceIds, bool copyData) {
+#ifdef USE_CUDA
+        AssertInFastLLM(deviceIds.size() <= 0, "ToCudaTemporary Error: can't set deviceids\n");
+        this->dataDevice = DataDevice::CPU;
+        size_t bytes = this->GetBytes();
+
+        if (copyData) {
+            FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, bytes);
+        }
+
+        if (this->isModelWeight) {
+            FastllmCudaFree(this->cudaData);
+            this->cudaData = nullptr;
+        }
+#else
+        ErrorInFastLLM("FreeCudaTemporary Error: don't support.");
+#endif
+    }
+
+    extern CPUInstructInfo cpuInstructInfo;
+
+    void Data::Repack() {
+        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
+            return;
+        }
+        if (GetEnableAMX() && cpuInstructInfo.hasAMX) {
+            return;
+        }
+        this->IsRepacked = true;
+        ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
+        auto repack = get_repack_info(tensor->type);
+        if (repack != nullptr) {
+// printf("repack %s (%s).\n", tensor->name.c_str(), ggml_type_name(tensor->type));
+            int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
+            auto row_size = ggml_row_size(tensor->type, n_per_row);
+            std::vector<uint8_t> qtmp(repack->num_rows * row_size);
+            uint8_t *qcur = (uint8_t*)this->cpuData;
+            for (int row = 0; row < nrows; row += repack->num_rows) {
+                memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
+                repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
+                qcur += repack->num_rows * row_size;
+            }
+
+            ((ggml_tensor*)this->ggmlTensor)->type = repack->new_type;
+            this->ggmlType = (int)repack->new_type;
+        } else {
+            // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
+            // weight->PrintShape();
+        }
+    }
+
     void Data::SetKVCache() {
         this->isKVCache = true;
         this->cacheUid = ((long long)this) * rand() * rand() * rand() * rand();
+    }
+
+    // 计算形成Fastllm格式需要多少Bytes
+    uint64_t Data::GetFastllmFormateBytes() {
+        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+            return this->GetBytes();
+        } 
+        uint64_t ret = 0;
+        ret += sizeof(int) * 2;
+        if (this->dataType == FP8_E4M3) {
+            ret += sizeof(int) * 3;
+            ret += this->scales.size() * sizeof(float);
+            ret += this->GetBytes();
+        } else if (this->dataType == INT4_NOZERO ||
+                    this->dataType == INT4 ||
+                    this->dataType == INT8) {
+            ret += sizeof(int);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            ret += k * 2 * sizeof(float);
+            ret += this->GetBytes();
+        } else if (this->dataType == INT4_GROUP) {
+            ret += sizeof(int) * 3;
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            ret += k * this->group * 2 * sizeof(float);
+            ret += this->GetBytes();
+        } else if (this->dataType == DATA_GGUF_FORMAT) {
+            ret += sizeof(int);
+            ret += this->GetBytes();
+        } else {
+            ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
+        }
+        return ret;
+    }
+
+    // 导出成Fastllm格式
+    void Data::ExportFastllmFormat(uint8_t *bytes) {
+        ByteWriter writer(bytes);
+        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+            writer.WriteBytes(this->cpuData, GetBytes());
+            return;
+        } 
+        writer.WriteInt(1); // 版本号
+        writer.WriteInt((int)this->dataType);
+        if (this->dataType == FP8_E4M3) {
+            writer.WriteInt(this->blockK);
+            writer.WriteInt(this->blockM);
+            writer.WriteInt((int)this->scales.size());
+            writer.WriteBytes((uint8_t*)this->scales.data(), (int)this->scales.size() * sizeof(float));
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+            writer.WriteInt(this->perChannelAxis);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            for (int i = 0; i < k; i++) {
+                writer.WriteFloat(this->perChannelsConfigs[i].min);
+                if (this->dataType == INT4_NOZERO) {
+                    writer.WriteFloat(this->perChannelsConfigs[i].scale);
+                } else {
+                    writer.WriteFloat(this->perChannelsConfigs[i].max);
+                }
+            }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT4_GROUP) {
+            writer.WriteInt(this->perChannelAxis);
+            writer.WriteInt(this->group);
+            writer.WriteInt(this->groupCnt);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            for (int i = 0; i < k * this->group; i++) {
+                writer.WriteFloat(this->mins[i]);
+                writer.WriteFloat(this->scales[i]);
+            }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == DATA_GGUF_FORMAT) {
+            writer.WriteInt(this->ggmlType);
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else {
+            ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
+        }
+    }
+
+    // 从Fastllm格式中创建
+    void Data::CreateFromFastllmFormat(uint8_t *datas, uint64_t len) {
+        this->weightType = WeightType::AUTO;
+        ByteReader reader(datas);
+        int version = reader.ReadInt();
+        if (version == 1) {
+            this->dataType = (DataType)reader.ReadInt();
+            if (this->dataType == DATA_GGUF_FORMAT) {
+                this->ggmlType = reader.ReadInt();
+            }
+            this->Resize(this->dims);
+            this->Allocate();
+            if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+                reader.ReadBytes(this->cpuData, len);
+                return;
+            } else if (this->dataType == FP8_E4M3) {
+                this->blockK = reader.ReadInt();
+                this->blockM = reader.ReadInt();
+                this->scales.resize(reader.ReadInt());
+                reader.ReadBytes((uint8_t*)this->scales.data(), (int)this->scales.size() * sizeof(float));
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+                this->perChannelAxis = reader.ReadInt();
+                int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+                this->perChannelsConfigs.resize(k);
+                this->mins.resize(k);
+                this->scales.resize(k);
+                this->zeros.resize(k);
+                for (int i = 0; i < k; i++) {
+                    if (this->dataType == INT4_NOZERO) {
+                        float minValue = reader.ReadFloat();
+                        float scale = reader.ReadFloat();
+                        this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
+                        this->perChannelsConfigs[i].min = minValue;
+                        this->perChannelsConfigs[i].scale = scale;
+                    } else {
+                        int bit = (dataType == DataType::INT4 ? 4 : 8);
+                        float minValue = reader.ReadFloat();
+                        float maxValue = reader.ReadFloat();
+                        this->perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
+                    }
+                    this->mins[i] = this->perChannelsConfigs[i].min;
+                    this->scales[i] = this->perChannelsConfigs[i].scale;
+                    this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
+                }
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT4_GROUP) {
+                this->perChannelAxis = reader.ReadInt();
+                this->group = reader.ReadInt();
+                this->groupCnt = reader.ReadInt();
+                int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+                // this->perChannelsConfigs.resize(k * this->group);
+                this->mins.resize(k * this->group);
+                this->scales.resize(k * this->group);
+                // this->zeros.resize(k * this->group);
+                for (int i = 0; i < k * this->group; i++) {
+                    float minValue = reader.ReadFloat();
+                    float scale = reader.ReadFloat();
+                    // this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
+                    // this->perChannelsConfigs[i].min = minValue;
+                    // this->perChannelsConfigs[i].scale = scale;
+                    this->mins[i] = minValue;
+                    this->scales[i] = scale;
+                    // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
+                }
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == DATA_GGUF_FORMAT) {
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else {
+                ErrorInFastLLM("CreateFromFastllmFormat Error: data type error.");
+            }
+        } else {
+            ErrorInFastLLM("CreateFromFastllmFormat error: unsupport version " + std::to_string(version));
+        }
+    }
+
+    DataType Data::GetDataType() {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            return (DataType)((int)DataType::DATA_GGUF_FORMAT + this->ggmlType);
+        } else {
+            return this->dataType;
+        }
+    }
+
+    DataType Data::GetLinearActDataType(int batchSize) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            if (batchSize > 31 && GetEnableAMX() && cpuInstructInfo.hasAMX) {
+                return DataType::BFLOAT16;
+            } else {
+                return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
+            }
+        } else if (this->dataType == DataType::FLOAT16) {
+            return DataType::FLOAT32;
+        } else if (this->dataType == DataType::INT4_PERCHANNEL ||
+                    this->dataType == DataType::INT8_PERCHANNEL) {
+            return DataType::INF_INT8_PERCHANNEL;
+        } else if (this->dataType == DataType::INT4_GROUP128) {
+            return DataType::INF_INT8_GROUP128;
+        } else if (this->dataType == DataType::BFLOAT16 || 
+                    this->dataType == DataType::FP8_E4M3 ||
+                    this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                    this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+            return DataType::BFLOAT16;
+        } else {
+            ErrorInFastLLM("GetLinearActDataType failed with type " + GetDataTypeName(this->dataType));
+            return DataType::FLOAT32;
+        }
     }
 
     std::string GetModelTypeFromFile(const std::string &fileName) {
@@ -1195,661 +2139,6 @@ namespace fastllm {
         }
         return ret;
     }
-
-    Tokenizer::TrieNode::TrieNode() {
-        this->tokenId = -999999;
-    }
-
-    Tokenizer::Tokenizer() {
-        root = new TrieNode();
-        int n = 0;
-        wchar_t special_token = L'\x0';
-        for (; special_token < L'!'; special_token++, n++) {
-            byteCharDict[L'\x100' + n] = special_token;
-            charByteDict[special_token] = L'\x100' + n;
-        }
-        for (special_token = L'\x7F'; special_token < L'\xA1'; special_token++, n++) {
-            byteCharDict[L'\x100' + n] = special_token;
-            charByteDict[special_token] = L'\x100' + n;
-        }
-        byteCharDict[L'\x100' + n++] = L'\xAD';
-        charByteDict[L'\xAD'] = L'\x100' + (n - 1);
-    }
-
-    Tokenizer::~Tokenizer() {
-        Clear();
-        delete root;
-    }
-
-    void Tokenizer::Clear() {
-        std::vector <TrieNode*> q;
-        q.push_back(root);
-        for (int i = 0; i < q.size(); i++) {
-            TrieNode *now = q[i];
-            for (auto it : now->next) {
-                q.push_back(it.second);
-            }
-        }
-        if (specialRoot != nullptr) {
-            q.push_back(specialRoot);
-            for (int i = q.size() - 1; i < q.size(); i++) {
-                TrieNode *now = q[i];
-                for (auto it : now->next) {
-                    q.push_back(it.second);
-                }
-            }
-        }
-        for (TrieNode * node : q)
-            delete node;
-        q.clear();
-        root = new TrieNode();
-        specialRoot = nullptr;
-        tokenToStringDict.clear();
-        tokenToScoreDict.clear();
-        stringToTokenDict.clear();
-    }
-
-    void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
-        TrieNode *now = this->root;
-        for (int i = 0; i < s.size(); i++) {
-            if (now->next.find(s[i]) == now->next.end()) {
-                now->next[s[i]] = new TrieNode();
-            }
-            now = now->next[s[i]];
-        }
-        now->tokenId = tokenId;
-        now->score = score;
-        tokenToStringDict[tokenId] = s;
-        tokenToScoreDict[tokenId] = score;
-        stringToTokenDict[s] = tokenId;
-    }
-
-    void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokenMap) {
-        if (specialRoot == nullptr)
-            specialRoot = new TrieNode();
-        for (auto &it : specialTokenMap) {
-            TrieNode *now = this->specialRoot;
-            for (int i = 0; i < it.first.size(); i++) {
-                if (now->next.find(it.first[i]) == now->next.end()) {
-                    now->next[it.first[i]] = new TrieNode();
-                }
-                now = now->next[it.first[i]];
-            }
-            now->tokenId = it.second;
-            now->score = 0.0f;
-            tokenToStringDict[it.second] = it.first;
-            stringToTokenDict[it.first] = it.second;
-            specialTokens.push_back(it.first);
-        }
-    }
-
-    void Tokenizer::SetTokenizerConfig(const json11::Json &config) {
-        this->tokenizerConfig = config;
-        if (config["chat_template"].is_string()) {
-            this->chatTemplate = config["chat_template"].string_value();
-        }
-    }
-
-    void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
-        if (l == -1 || r == -1 || symbols[l].len == 0 || symbols[r].len == 0) {
-            return;
-        }
-        auto now = symbols[l].node;
-        char *s = symbols[r].s;
-        int pos = symbols[r].pos, len = symbols[r].len;
-        for (int i = pos; i < pos + len; i++) {
-            if (now->next.find(s[i]) != now->next.end()) {
-                now = now->next[s[i]];
-            } else {
-                return;
-            }
-        }
-        if (now->tokenId == -999999) {
-            return;
-        }
-        q.push(SymbolPairs(now->score, l, r, symbols[l].len + symbols[r].len));
-    }
-
-    int Tokenizer::GetRank(std::vector <Symbol> &symbols, PartitionLinkNode *cur, int skip) {
-        auto nxt = cur->Skip(skip + 2);
-        if (nxt == nullptr) {
-            return std::numeric_limits<int>::max();
-        }
-        auto s = symbols[0].s + symbols[0].pos;
-        std::string key(s + cur->cur->first, s + nxt->cur->first);
-        if (stringToTokenDict.find(key) != stringToTokenDict.end()) {
-            return stringToTokenDict[key];
-        }
-        return std::numeric_limits<int>::max();
-    }
-
-    int Tokenizer::GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip) {
-        if (idx + skip + 2 >= partitions.size()) {
-            return std::numeric_limits<int>::max();
-        }
-        auto s = symbols[0].s + symbols[0].pos;
-        std::string key(s + partitions[idx].first, s + partitions[idx + skip + 2].first);
-        if (stringToTokenDict.find(key) != stringToTokenDict.end()) {
-            return stringToTokenDict[key];
-        }
-        return std::numeric_limits<int>::max();
-    }
-
-    std::string Tokenizer::Normalize(const std::string &ori) {
-        if (this->byteAsChar) {
-            std::wstring ws(ori.size(), L' ');
-            for (int i=0; i < ori.length(); i++) {
-                wchar_t wi = static_cast<wchar_t>(static_cast<unsigned char>(ori[i]));
-                if (charByteDict.find(wi) != charByteDict.end()) {
-                    wi = charByteDict[wi];
-                }
-                ws[i] = wi;
-            }
-            return converter.to_bytes(ws);
-        }
-        std::string blank = "";
-        blank += 226, blank += 150, blank += 129;
-        std::string s = this->addDummyPrefix ? blank : "";
-        if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
-            s = "";
-        }
-        for (int i = 0; i < ori.size(); i++) {
-            if (ori[i] == ' ') {
-                if (!(this->removeExtraWhitespaces && i > 0 && ori[i - 1] == ' ')) {
-                    s += blank;
-                }
-            } else {
-                s += ori[i];
-            }
-        }
-        return s;
-    }
-
-    bool isDigitOrChar(char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    }
-
-    Data Tokenizer::Encode(const std::string &ori) {
-        if (this->type == TokenizerType::BPE) {
-            std::string s = Normalize(ori);
-
-            std::vector<Symbol> symbols;
-            for (int i = 0; i < s.size(); i++) {
-                if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
-                    if (i + 15 < s.size() && s.substr(i, 15) == "<FLM_FIX_TOKEN_") {
-                        i += 15;
-                        int now = 0;
-                        while (s[i] >= '0' && s[i] <= '9') {
-                            now = now * 10 + s[i] - '0';
-                            i++;
-                        }
-                        symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
-                                                 (int) symbols.size() + 1, now));
-                        continue;
-                    }
-                }
-
-                if (this->specialRoot != nullptr) {
-                    TrieNode *now = this->specialRoot;
-                    int next = i;
-                    for (; next < s.size(); next++) {
-                        if (now->next.find(s[next]) == now->next.end())
-                            break;
-                        now = now->next[s[next]];
-                    }
-                    if (now->tokenId != -999999 && next > i) {
-                        symbols.push_back(Symbol(nullptr, (char *)s.data(), i, 0, (int) symbols.size() - 1,
-                                          (int) symbols.size() + 1, now->tokenId));
-                        i = next - 1;
-                        continue;
-                    }
-                }
-
-                int tokenId = -999999, pos = i - 1;
-                TrieNode *now = this->root;
-                for (int j = i; j < s.size(); j++) {
-                    if (now->next.find(s[j]) != now->next.end()) {
-                        now = now->next[s[j]];
-                        if (now->tokenId != -999999) {
-                            tokenId = now->tokenId;
-                            pos = j;
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (pos >= i) {
-                    symbols.push_back(Symbol(now, (char *) s.data(), i, pos - i + 1, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1, -999999));
-                    i = pos;
-                } else {
-                    symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1, -999999));
-                }
-            }
-            symbols.back().next = -1;
-
-            std::priority_queue<SymbolPairs> workQueue;
-            for (int i = 1; i < symbols.size(); i++) {
-                TryMergePairs(symbols, i - 1, i, workQueue);
-            }
-
-            while (!workQueue.empty()) {
-                auto top = workQueue.top();
-                workQueue.pop();
-                if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
-                    symbols[top.l].len + symbols[top.r].len != top.size) {
-                    continue;
-                }
-
-                for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
-                    symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
-                }
-                symbols[top.l].len += symbols[top.r].len;
-                symbols[top.r].len = 0;
-                symbols[top.l].next = symbols[top.r].next;
-                if (symbols[top.r].next >= 0) {
-                    symbols[symbols[top.r].next].prev = top.l;
-                }
-
-                TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
-                TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
-            }
-
-            std::vector<float> v;
-            for (int i = 0; i < symbols.size(); i++) {
-                if (symbols[i].len > 0) {
-                    v.push_back(symbols[i].node->tokenId);
-                } else if (symbols[i].node == nullptr) {
-                    if (symbols[i].fixId != -999999) {
-                        v.push_back(symbols[i].fixId);
-                    } else {
-                        // 未识别的字符
-                        uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
-                        std::string now = "<0x00>";
-                        now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
-                        now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
-                        if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
-                            v.push_back(stringToTokenDict[now]);
-                        }
-                    }
-                }
-            }
-            return Data(DataType::FLOAT32, {1, (int)v.size()}, v);
-        } else if (this->type == TokenizerType::GLM) {
-            const std::map<std::string, int> specialTokens = {{"[MASK]", 50003}, {"[sMASK]", 50008}, {"[gMASK]", 50009}};
-            std::string s = Normalize(ori);
-            std::vector<float> v;
-            int findPos = 0;
-            while (findPos < s.length()) {
-                int nextSpecialToken = -1;
-                int nextSpecialTokenPos = -1;
-                int nextSpecialTokenLen = -1;
-                for (auto p : specialTokens) {
-                    int ind = s.find(p.first, findPos);
-                    if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
-                        nextSpecialTokenPos = ind;
-                        nextSpecialToken = p.second;
-                        nextSpecialTokenLen = p.first.length();
-                    }
-                }
-                std::string subStr;
-                if (nextSpecialTokenPos < 0) {
-                    subStr = s.substr(findPos);
-                    findPos = s.length();
-                } else {
-                    subStr = s.substr(findPos, nextSpecialTokenPos - findPos);
-                    findPos = nextSpecialTokenPos + nextSpecialTokenLen;
-                }
-                if (subStr.length() > 0) {
-#ifdef USE_SENTENCEPIECE
-                    if (spProcessor!=nullptr) {
-                        std::vector<int> ids;
-                        spProcessor->Encode(subStr, &ids);
-                        fo r(int id : ids) {
-                            v.push_back(id);
-                        }
-                    } else {
-#endif
-                    std::vector<Symbol> symbols;
-                    for (int i = 0; i < subStr.size(); i++) {
-                        int tokenId = -999999, pos = i - 1;
-                        TrieNode *now = this->root;
-                        for (int j = i; j < subStr.size(); j++) {
-                            if (now->next.find(subStr[j]) != now->next.end()) {
-                                now = now->next[subStr[j]];
-                                if (now->tokenId != -999999) {
-                                    tokenId = now->tokenId;
-                                    pos = j;
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        if (pos >= i) {
-                            symbols.push_back(Symbol(now, (char *) subStr.data(), i, pos - i + 1, (int) symbols.size() - 1,
-                                                     (int) symbols.size() + 1, -999999));
-                            i = pos;
-                        } else {
-                            symbols.push_back(Symbol(nullptr, (char *) subStr.data(), i, 0, (int) symbols.size() - 1,
-                                                     (int) symbols.size() + 1, -999999));
-                        }
-                    }
-                    symbols.back().next = -1;
-
-                    std::priority_queue<SymbolPairs> workQueue;
-                    for (int i = 1; i < symbols.size(); i++) {
-                        TryMergePairs(symbols, i - 1, i, workQueue);
-                    }
-
-                    while (!workQueue.empty()) {
-                        auto top = workQueue.top();
-                        workQueue.pop();
-                        if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
-                                symbols[top.l].len + symbols[top.r].len != top.size) {
-                            continue;
-                        }
-
-                        for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
-                            symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
-                        }
-                        symbols[top.l].len += symbols[top.r].len;
-                        symbols[top.r].len = 0;
-                        symbols[top.l].next = symbols[top.r].next;
-                        if (symbols[top.r].next >= 0) {
-                            symbols[symbols[top.r].next].prev = top.l;
-                        }
-
-                        TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
-                        TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
-                    }
-                    for (int i = 0; i < symbols.size(); i++) {
-                        if (symbols[i].len > 0) {
-                            v.push_back(symbols[i].node->tokenId);
-                        } else if (symbols[i].node == nullptr) {
-                            if (symbols[i].fixId != -999999) {
-                                v.push_back(symbols[i].fixId);
-                            } else {
-                                // 未识别的字符
-                                uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
-                                std::string now = "<0x00>";
-                                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
-                                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
-                                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
-                                    v.push_back(stringToTokenDict[now]);
-                                }
-                            }
-                        }
-                    }
-#ifdef USE_SENTENCEPIECE
-                    }
-#endif
-                }
-                if (nextSpecialTokenPos >= 0) {
-                    v.push_back(nextSpecialToken);
-                }
-            }
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
-        } else if (this->type == TokenizerType::QWEN) {
-            std::map<std::string, int> specialTokens = {{"<|im_start|>", 151644}, {"<|im_end|>", 151645}, {"<|endoftext|>", 151643}};
-            for (int i = 0; i < ori.size(); i++) {
-                if (i + 3 < ori.size() && ori[i] == '<' && ori[i + 1] == 'F' && ori[i + 2] == 'L' && ori[i + 3] == 'M') {
-                    if (i + 15 < ori.size() && ori.substr(i, 15) == "<FLM_FIX_TOKEN_") {
-                        i += 15;
-                        int now = 0;
-                        while (ori[i] >= '0' && ori[i] <= '9') {
-                            now = now * 10 + ori[i] - '0';
-                            i++;
-                        }
-                        specialTokens["<FLM_FIX_TOKEN_" + std::to_string(now) + ">"] = now;
-                        continue;
-                    }
-                }
-            }
-            
-            // comment these special tokens for now
-            // for (int i = 0; i < 205; i++) {
-            //     specialTokens.insert("<|extra_" + std::to_string(i) + "|>");
-            // }
-
-            std::vector<std::pair<int, int>> sep;
-            for (auto &token : specialTokens) {
-                int pos = 0;
-                while ((pos = ori.find(token.first, pos)) != std::string::npos) {
-                    sep.push_back({pos, token.first.size()});
-                    pos += token.first.size();
-                }
-            }
-            sep.push_back({ori.size(), 1}); // use this to tokenize the last few words
-            std::sort(sep.begin(), sep.end(), std::greater<std::pair<int, int>>());
-
-            std::vector<Symbol> symbols;
-            std::vector<float> v;
-
-            for (int i = 0; i <= ori.size(); i++) {
-                if (i == sep.back().first) {
-                    if (!symbols.empty()) {
-                        symbols.back().next = -1;
-                        std::string cur = ori.substr(i - symbols.size(), symbols.size());
-                        std::vector<std::pair<int, int>> partitions(symbols.size() + 1);
-                        std::vector <PartitionLinkNode> nodes(symbols.size() + 1);
-                        for (int j = 0; j <= (int) symbols.size(); j++) {
-                            partitions[j] = std::make_pair(j, std::numeric_limits<int>::max());
-                        }
-                        for (int j = 0; j <= (int) symbols.size(); j++) {
-                            nodes[j].cur = &partitions[j];
-                            if (j > 0) {
-                                nodes[j].prev = &nodes[j - 1];
-                            }
-                            if (j + 1 < nodes.size()) {
-                                nodes[j].next = &nodes[j + 1];
-                            }
-                            nodes[j].id = j;
-                        }
-                        for (int j = 0; j < partitions.size() - 2; j++) {
-                            partitions[j].second = GetRank(symbols, partitions, j, 0);
-                        }
-                        std::set <std::pair <int, int> > pq;
-                        for (int j = 0; j < nodes.size(); j++) {
-                            pq.insert(std::make_pair(nodes[j].cur->second, j));
-                        }
-                        int del = 0;
-                        while (partitions.size() - del > 1) {
-                            int min_rank = pq.begin()->first;
-                            auto sel = &nodes[pq.begin()->second];
-
-                            if (min_rank != std::numeric_limits<int>::max()) {
-                                pq.erase(std::make_pair(sel->cur->second, sel->id));
-                                sel->cur->second = GetRank(symbols, sel, 1);
-                                pq.insert(std::make_pair(sel->cur->second, sel->id));
-                                if (sel->prev != nullptr) {
-                                    pq.erase(std::make_pair(sel->prev->cur->second, sel->prev->id));
-                                    sel->prev->cur->second = GetRank(symbols, sel->prev, 1);
-                                    pq.insert(std::make_pair(sel->prev->cur->second, sel->prev->id));
-                                }
-                                pq.erase(std::make_pair(sel->next->cur->second, sel->next->id));
-                                sel->next = sel->next->next;
-                                sel->next->prev = sel;
-                                del++;
-                            } else {
-                                break;
-                            }
-                        }
-                        auto it = &nodes[0];
-                        while (it != nullptr && it->next != nullptr) {
-                            std::string key = cur.substr(it->cur->first, it->next->cur->first - it->cur->first);
-                            v.push_back((float) stringToTokenDict[key]);
-                            it = it->next;
-                        }
-                        symbols.clear();
-                    }
-
-                    std::string special = ori.substr(sep.back().first, sep.back().second);
-                    if (specialTokens.find(special) != specialTokens.end()) {
-                        v.push_back(specialTokens[special]);
-                    }
-
-                    i += sep.back().second - 1;
-                    sep.pop_back();
-
-                    continue;
-                }
-
-                int tokenId = -999999, pos = i - 1;
-                TrieNode *now = this->root;
-                for (int j = i; j < ori.size(); j++) {
-                    if (now->next.find(ori[j]) != now->next.end()) {
-                        now = now->next[ori[j]];
-                        if (now->tokenId != -999999) {
-                            tokenId = now->tokenId;
-                            pos = j;
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (pos >= i) {
-                    symbols.push_back(Symbol(now, (char *) ori.data(), i, pos - i + 1, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1, -999999));
-                    i = pos;
-                } else {
-                    symbols.push_back(Symbol(nullptr, (char *) ori.data(), i, 0, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1, -999999));
-                }
-            }
-
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
-        } else if (this->type == TokenizerType::BERT) {
-            std::vector <float> v;
-            for (int i = 0; i < ori.size(); i++) {
-                int tokenId = -999999, pos = i - 1;
-                TrieNode *now = this->root;
-
-                if (i > 0 && isDigitOrChar(ori[i - 1]) && isDigitOrChar(ori[i])) {
-                    now = now->next['#']->next['#'];
-                }
-                for (int j = i; j < ori.size(); j++) {
-                    if (now->next.find(ori[j]) != now->next.end()) {
-                        now = now->next[ori[j]];
-                        if (now->tokenId != -999999) {
-                            tokenId = now->tokenId;
-                            pos = j;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (pos >= i) {
-                    i = pos;
-                    v.push_back(tokenId);
-                }
-            }
-
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
-        } else {
-            std::vector <float> v;
-            for (int i = 0; i < ori.size(); i++) {
-                int tokenId = -999999, pos = i - 1;
-                TrieNode *now = this->root;
-                for (int j = i; j < ori.size(); j++) {
-                    if (now->next.find(ori[j]) != now->next.end()) {
-                        now = now->next[ori[j]];
-                        if (now->tokenId != -999999) {
-                            tokenId = now->tokenId;
-                            pos = j;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (pos >= i) {
-                    i = pos;
-                    v.push_back(tokenId);
-                }
-            }
-
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
-        }
-    }
-
-    std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
-        std::string ret = "";
-        for (int i = 0; i < tokens.size(); i++) {
-            std::string s = tokenToStringDict[tokens[i]];
-            if (s.size() == 6 && s.substr(0, 3) == "<0x" && s.back() == '>') {
-                int c = 0;
-                for (int i = 3; i < 5; i++) {
-                    c *= 16;
-                    if (s[i] >= '0' && s[i] <= '9') {
-                        c += (s[i] - '0');
-                    } else {
-                        c += (s[i] - 'A' + 10);
-                    }
-                }
-
-                s = " ";
-                s[0] = c;
-            }
-            if (s == "<n>") {
-                ret += "\n";
-            } else if (s == "<|tab|>") {
-                ret += "\t";
-            } else {
-                ret += s;
-            }
-        }
-
-        std::string blank = "";
-        blank += 226, blank += 150, blank += 129;
-        while (true) {
-            std::string::size_type pos(0);
-            if ((pos = ret.find(blank)) != std::string::npos)
-                ret.replace(pos, blank.length(), " ");
-            else break;
-        }
-        if (this->byteAsChar) {
-            std::wstring wret = converter.from_bytes(ret);
-            std::string decoded(wret.size(), ' ');
-            for (int i=0; i < wret.length(); i++) {
-                if (byteCharDict.find(wret[i]) != byteCharDict.end()) {
-                    wret[i] = byteCharDict[wret[i]];
-                }
-                decoded[i] = static_cast<char>(wret[i]);
-            }
-            ret = decoded;
-        }
-        int pos = ret.find("<|blank_");
-        if (pos != -1) {
-            int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
-            return std::string(space_num, ' ');
-        }
-
-        return ret;
-    }
-
-    std::string Tokenizer::Decode(const Data &data) {
-        std::vector <int> tokens;
-        for (int i = 0; i < data.Count(0); i++) {
-            tokens.push_back((int) ((float *) data.cpuData)[i]);
-        }
-        return DecodeTokens(tokens);
-    }
-
-    int Tokenizer::GetTokenId(const std::string &s) {
-        AssertInFastLLM(stringToTokenDict.find(s) != stringToTokenDict.end(), 
-                        "Tokenizer.GetTokenId error: can't find token \"" + s + "\"");
-        return stringToTokenDict[s];
-    }
-
-    std::string Tokenizer::GetToken(int id) {
-        AssertInFastLLM(tokenToStringDict.find(id) != tokenToStringDict.end(), 
-                        "Tokenizer.GetToken error: can't find tokenid \"" + std::to_string(id) + "\"");
-        return this->DecodeTokens(std::vector <int> {id}).c_str();
-    }
-
     struct Random {
         Random () {
             srand(time(NULL));
@@ -1869,7 +2158,15 @@ namespace fastllm {
         float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
 
         if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            for (int id : tokens.tokenSet) {
+            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
+            std::multiset<int>::iterator end = tokens.tokenSet.end();
+            std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
+            if (config.last_n <= 0) {
+                begin = unique.begin();
+                end = unique.end();
+            }
+            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
+                int id = *iter;
                 base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
             }
         }
@@ -1901,6 +2198,38 @@ namespace fastllm {
             curSum += ps[i];
             if (curSum > rnd || i == topk - 1) {
                 return v[i].second;
+            }
+        }
+        return -1;
+    }
+
+    // 已经做过repeat_penalty和topk，仅做采样
+    int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config) {
+        int maxTopKSize = logits.dims.back() / 2;
+        float *base = ((float*)logits.cpuData) + outerOffset * maxTopKSize * 2;
+        float invTemp = 1.0f / config.temperature;
+        int topk = config.top_k;
+        float psum = 0.0, maxValue = base[1];
+        std::vector <float> ps;
+        for (int i = 0; i < topk; i++) {
+            ps.push_back(expf(base[i * 2 + 1] - maxValue));
+            psum += ps.back();
+        }
+        float curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            ps[i] /= psum;
+            curSum += ps[i];
+            if (curSum > config.top_p) {
+                topk = i + 1;
+                break;
+            }
+        }
+        float rnd = fastllmRandom.randP() * curSum;
+        curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            curSum += ps[i];
+            if (curSum > rnd || i == topk - 1) {
+                return base[i * 2];
             }
         }
         return -1;
@@ -1967,6 +2296,8 @@ namespace fastllm {
             }
             tokenizer.SetSpecialTokens(specialTokens);
         }
+        if (this->dicts.find("chat_template") != this->dicts.end())
+            tokenizer.chatTemplate = this->dicts["chat_template"];
 
         int len = buffer.ReadInt();
         for (int i = 0; i < len; i++) {
@@ -2355,6 +2686,13 @@ namespace fastllm {
     void WeightMap::AddEmptyWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType) {
         this->weight[key] = Data(dataType, dims);
         this->weight[key].name = std::string(key);
+        this->weight[key].isModelWeight = true;
+    }
+
+    void WeightMap::AddEmptyGGMLWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType, int ggmlType) {
+        this->weight[key] = Data(dataType, ggmlType, dims);
+        this->weight[key].name = std::string(key);
+        this->weight[key].isModelWeight = true;
     }
 
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
@@ -2488,23 +2826,17 @@ namespace fastllm {
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else {
-            ErrorInFastLLM("wrong data type");
+            ErrorInFastLLM("wrong data type " + dataTypeNames[oriDataType][0] + " -> " + dataTypeNames[dataType][0]);
         }
     }
 
     void WeightMap::ReleaseWeight() {
         for (auto &w : this->weight) {
-#ifndef USE_MMAP
-            delete[] w.second.cpuData;
-            w.second.cpuData = nullptr;
-#endif
-#ifdef USE_CUDA
-            if (w.second.cudaData != nullptr) {
-                FastllmCudaDirectFree(w.second.cudaData);
-                w.second.cudaData = nullptr;
-            }
-#endif
+            w.second.FreeSpace();
         }
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
     }
 
     Data &WeightMap::operator[](const std::string &key) {
@@ -2523,8 +2855,30 @@ namespace fastllm {
             curExecutor->Run("ToFloat16", {
                     {"input", (Data*)&input}
             }, {}, {});
+        } else if (dataType == DataType::BFLOAT16) {
+            curExecutor->Run("ToBFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
         } else {
-            ErrorInFastLLM("ToDataDevice: Unsupport data type.\n");
+            ErrorInFastLLM("ToDataType: Unsupport data type.\n");
+        }
+    }
+
+    void ToDataType(const Data &input, Data &output, DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+            curExecutor->Run("ConvertToFloat32", {
+                    {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else if (dataType == DataType::FLOAT16) {
+            curExecutor->Run("ConvertToFloat16", {
+                {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else if (dataType == DataType::BFLOAT16) {
+            curExecutor->Run("ConvertToBFloat16", {
+                {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else {
+            ErrorInFastLLM("ToDataType: Unsupport data type.\n");
         }
     }
 
@@ -2536,27 +2890,66 @@ namespace fastllm {
         });
     }
 
-    bool CanRunMergeMOE() {
-        return curExecutor->CanRunOnFirstDevice("MergeMOE", {}, {}, {});
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass) {
+        return curExecutor->CanRunOnFirstDevice("MergeMOE", {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}}, {}, {});
     }
 
-    void MergeMOE(const Data &input, const Data &logits, std::vector <Data*> weights, std::vector <Data*> biass, 
-                float routeScale, float sharedScale, int topk, Data &output) {
+    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+                Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
+                float sharedScale, Data &output, int layer) {
         curExecutor->Run("MergeMOE", {
-                {"input", (Data*)&input}, {"logits", (Data*)&logits},
+                {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
+                {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
+                {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}});
+        }, {{"sharedScale", sharedScale}}, 
+                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}});
     }
+
+    void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale) {
+        curExecutor->Run("MergeMLA", {
+            {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCache", (Data*)&kvCache}, {"peCache", (Data*)&peCache},
+            {"mask", (Data*)&mask}, {"output", (Data*)&output}
+        }, {{"softmaxScale", softmaxScale}}, {});
+    }
+
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale) {
+        curExecutor->Run("MergeMLAPaged", {
+            {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCachePaged", (Data*)&kvCachePaged}, {"peCachePaged", (Data*)&peCachePaged},
+            {"output", (Data*)&output}
+        }, {{"softmaxScale", softmaxScale}}, {});
+    }
+
+    // attentionType
+    // 1: normal
+    // 2: 不做mask
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType) {
-        int maskType = 0; // 0: 因果mask
-        
+        int maskType = 0; // 0: 因果mask, 2: 不做mask
+        if (attentionType == 2) {
+            maskType = 2;
+        }
         curExecutor->Run("Attention", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
                 {"mask", (Data*)&mask}, {"output", (Data*)&output}
         }, {{"scale", scale}}, {{"group", group}, {"maskType", maskType}});
+    }
+
+    void Conv1DPerChannel(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, 
+            int kernel, int stride, int pad, Data &output) {
+        curExecutor->Run("Conv1DPerChannel", {
+                {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
+        }, {}, {{"inputChannels", inputChannels}, {"outputChannels", outputChannels}, {"kernel", kernel}, 
+                {"stride", stride}, {"pad", pad}});
+    }
+
+    void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output) {
+        curExecutor->Run("Conv2D", {
+                {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
+        }, {}, {{"inputChannels", inputChannels}, {"outputChannels", outputChannels}, {"kernelH", kernelH}, {"kernelW", kernelW}, 
+                {"strideH", strideH}, {"strideW", strideW}, {"padH", padH}, {"padW", padW}});
     }
 
     void Embedding(const Data &input, Data &weight, Data &output) {
@@ -2565,10 +2958,22 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void EmbeddingDirect(const Data &input, Data &weight, Data &output) {
+        curExecutor->Run("EmbeddingDirect", {
+                {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
+        }, {}, {});
+    }
+
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output) {
         curExecutor->Run("RMSNorm", {
                 {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
         }, {{"eps", eps}}, {});
+    }
+
+    void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output) {
+        curExecutor->Run("RMSNormPart", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
+        }, {{"eps", eps}}, {{"start", start}, {"end", end}});
     }
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output) {
@@ -2583,14 +2988,76 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {
+        curExecutor->Run("LinearAdd", 
+            {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"middle", (Data*)&middle}, {"output", (Data*)&output}}, 
+        {}, {});
+    }
+
+    bool CanRunLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output) {
+        return curExecutor->CanRunOnFirstDevice("LinearAdd", {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"output", (Data*)&output}}, {}, {});
+    }
+
+    void LinearSwiglu(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {
+        curExecutor->Run("LinearSwiglu", {
+            {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"middle", (Data*)&middle}, {"output", (Data*)&output}
+        }, {}, {});
+    }
+
+    bool CanRunLinearSwiglu(const Data &input, const Data &weight) {
+        return curExecutor->CanRunOnFirstDevice("LinearSwiglu", {{"input", (Data*)&input}, {"weight", (Data*)&weight}}, {}, {});
+    }
+
     bool CanRunLinearEx(LinearExType exType) {
         return curExecutor->CanRunOnFirstDevice("Linear", {}, {}, {{"exType", (int)exType}});
+    }
+
+    bool CanRunMLP() {
+        return curExecutor->CanRunOnFirstDevice("MLP", {}, {}, {});
+    }
+
+    bool CanRunMergeAttention() {
+        return curExecutor->CanRunOnFirstDevice("MergeAttention", {}, {}, {});
     }
 
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output, LinearExType exType) {
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
         }, {}, {{"exType", (int)exType}});
+    }
+
+    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, 
+            Data &w1, Data &w2, Data &w3, Data &output) {
+        curExecutor->Run("MLP", {
+                {"input", &input}, 
+                {"weight0", &weight0}, {"bias0", (Data*)&bias0}, 
+                {"weight1", &weight1}, {"bias1", (Data*)&bias1}, 
+                {"w1", &w1}, {"w2", &w2}, {"w3", &w3},
+                {"output", &output}
+        }, {}, {});
+    }
+
+    void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
+        bool doQKNorm, Data &qNorm, Data &kNorm, float eps,
+        Data &qkv, Data &q, Data &k, Data &v,
+        int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
+        const Data &positionIds, Data &sinData, Data &cosData,
+        std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
+        Data &output) {
+        curExecutor->Run("MergeAttention", {
+                {"input", &input}, 
+                {"weight0", &weight0}, {"bias0", &bias0}, 
+                {"weight1", &weight1}, {"bias1", &bias1}, 
+                {"qNorm", &qNorm}, {"kNorm", &kNorm}, 
+                {"qkv", &qkv}, {"q", &q}, {"k", &k}, {"v", &v}, 
+                {"positionIds", (Data*)&positionIds},
+                {"sinData", (Data*)&sinData},
+                {"cosData", (Data*)&cosData},
+                {"keys", (Data*)keys.data()}, {"values", (Data*)values.data()}, {"masks", (Data*)masks.data()},
+                {"output", &output}
+        }, {{"attentionScale", attentionScale}, {"eps", eps}}, 
+        {{"doQKNorm", doQKNorm}, {"qNum", qNum}, {"kvNum",kvNum}, {"headDim", headDim}, {"rotDim", rotDim},
+        {"keys___batch", (int)keys.size()}, {"values___batch", (int)values.size()}, {"masks___batch", (int)masks.size()}});
     }
 
     void Split(const Data &input, int axis, int start, int end, Data &output) {
@@ -2609,6 +3076,12 @@ namespace fastllm {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
         }, {}, {{"axis", axis}});
+    }
+
+    void Pad(const Data &input, int axis, int padSize, Data &output) {
+        curExecutor->Run("Pad", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {{"axis", axis}, {"padSize", padSize}});
     }
 
     void CatDirect(Data &input0, const Data &input1, int axis) {
@@ -2635,6 +3108,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}});
     }
 
+    void Normalize(const Data &input, Data &output, int axis) {
+        curExecutor->Run("Normalize", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {{"axis", axis}});
+    }
+
     void Silu(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Silu", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -2643,6 +3122,24 @@ namespace fastllm {
 
     void TanH(const Data &input, Data &output) {
         curExecutor->Run("TanH", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Relu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Relu", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Sigmoid(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Sigmoid", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Exp(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Exp", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {});
     }
@@ -2665,6 +3162,25 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void MambaSoftplus(const Data &input, Data &aLog, Data &dtBias, Data &output) {
+        curExecutor->Run("MambaSoftplus", {
+                {"input", (Data*)&input}, {"aLog", &aLog}, {"dtBias", &dtBias}, {"output", &output}
+        }, {}, {});
+    }
+
+    void SigmoidMambaSoftplus(Data &sigmoidInputOutput, const Data &softplusInput, Data &aLog, Data &dtBias, Data &softplusOutput) {
+        curExecutor->Run("SigmoidMambaSoftplus", {
+                {"sigmoidInputOutput", &sigmoidInputOutput}, {"softplusInput", (Data*)&softplusInput},
+                {"aLog", &aLog}, {"dtBias", &dtBias}, {"softplusOutput", &softplusOutput}
+        }, {}, {});
+    }
+
+    void SwigluGptOss(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("SwigluGptOss", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void Mul(const fastllm::Data &input, float v, fastllm::Data &output) {
         curExecutor->Run("Mul", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -2674,6 +3190,36 @@ namespace fastllm {
     void MulTo(Data &input0, const Data &input1) {
         curExecutor->Run("MulTo", {
                 {"input0", &input0}, {"input1", (Data*)&input1}
+        }, {}, {});
+    }
+
+    void CausalMask(Data &input, int base, float maskValue) {
+        curExecutor->Run("CausalMask", {
+                {"input", &input}
+        }, {{"maskValue", maskValue}}, {{"base", base}});
+    }
+
+    void TransferAttn(Data &input) {
+        curExecutor->Run("TransferAttn", {
+                {"input", &input}
+        }, {}, {});
+    }
+
+    void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
+                                Data &last_recurrent_state, Data &core_attn_out, float qScale) {
+        curExecutor->Run("RecurrentGatedDeltaRule", {
+            {"q", &q}, {"k", &k}, {"v", &v}, {"g", &g}, {"b", &b}, 
+            {"last_recurrent_state", &last_recurrent_state}, {"core_attn_out", &core_attn_out}
+        }, {{"qScale", qScale}}, {});                 
+    }
+
+    void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,
+                                Data &attn, Data &k_cumdecay,
+                                Data &last_recurrent_state, Data &core_attn_out) {
+        curExecutor->Run("ChunkGatedDeltaRulePrefill", {
+            {"q", &q}, {"k", &k}, {"v", &v}, {"g", &g},
+            {"attn", &attn}, {"k_cumdecay", &k_cumdecay},
+            {"last_recurrent_state", &last_recurrent_state}, {"core_attn_out", &core_attn_out}
         }, {}, {});
     }
 
@@ -2729,16 +3275,26 @@ namespace fastllm {
         }, {}, {{"topk", topk}});
     };
 
+    void SelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm, float routeScale, const Data *gateBias) {
+        DataDict datas = {{"logits", (Data*)&logits}, {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        curExecutor->Run("SelectExpert", datas, 
+            {{"routeScale", routeScale}}, 
+            {{"topk", topk}, {"needNorm", needNorm ? 1 : 0}});
+    };
+
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
         curExecutor->Run("RotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
-    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int positionStride) {
         curExecutor->Run("NearlyRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
-        }, {}, {{"rotaryDim", rotaryDim}});
+        }, {}, {{"rotaryDim", rotaryDim}, {"positionStride", positionStride}});
     }
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
@@ -2747,15 +3303,74 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
-    void RepeatPenalty(Data &input, const Data &penalty) {
+    void LlamaRotatePosition2DPart(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int part) {
+        curExecutor->Run("LlamaRotatePosition2DPart", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
+        }, {}, {{"rotaryDim", rotaryDim}, {"part", part}});
+    }
+
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
+        curExecutor->Run("RopeEncoding", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
+                        const Data &positionIds, int q_heads, int k_heads, int head_dim,
+                        int rotaryDim, float eps, float ropeTheta, float ropeScale) {
+        curExecutor->Run("QKVRMSNormRope", {
+                {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds}
+        }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}});
+    }
+
+    void QKVRMSNormRopeSplitAppendPagedCache(
+        Data &qkv, Data &qNormWeight, Data &kNormWeight,
+        const Data &positionIds,
+        Data &qOutput,
+        Data &pagedKCacheData, Data &pagedVCacheData,
+        Data &insertIndexs, Data &insertPositions,
+        int q_heads, int k_heads, int head_dim,
+        int rotaryDim, float eps, float ropeTheta, float ropeScale,
+        int pageLen, int batch, bool doQKNorm) {
+        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", {
+                {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds},
+                {"qOutput", &qOutput},
+                {"pagedKCacheData", &pagedKCacheData}, {"pagedVCacheData", &pagedVCacheData},
+                {"insertIndexs", &insertIndexs}, {"insertPositions", &insertPositions}
+        }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}});
+    }
+
+    void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
-                {"input", &input}, {"penalty", (Data*)&penalty}
+                {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}
         }, {}, {});
     }
 
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds) {
         curExecutor->Run("ApplyLognAttn", {
             {"input", &input}, {"lognAttn", (Data *) &lognAttn}, {"positionIds", (Data *) &positionIds}
+        }, {}, {});
+    }
+
+    void CumSumLastDim(Data &input) {
+        curExecutor->Run("CumSumLastDim", {
+            {"input", &input}
+        }, {}, {});
+    }
+
+    void MakeDecayMask(Data &input, Data &output) {
+        curExecutor->Run("MakeDecayMask", {
+            {"input", &input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void ApplyChunkDecayByLastLogG(Data &input, const Data &g) {
+        curExecutor->Run("ApplyChunkDecayByLastLogG", {
+            {"input", &input}, {"g", (Data*)&g}
         }, {}, {});
     }
 
@@ -2828,6 +3443,171 @@ namespace fastllm {
         });
     }
 
+    static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
+
+    PagedCacheManager* GetPagedCacheManager(int layerIndex) {
+        auto it = layerPagedCacheManagers.find(layerIndex);
+        if (it == layerPagedCacheManagers.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
+        PagedCacheManager::PagedCacheManagerType type, 
+        const Data &cacheData, 
+        int pageLen, 
+        int maxPages) {
+        if (pageLen <= 0) {
+            pageLen = GetPageLen();
+        }
+        auto it = layerPagedCacheManagers.find(layerIndex);
+        if (it != layerPagedCacheManagers.end()) {
+            return it->second;
+        }
+
+        // 创建新的 PagedCacheManager
+        PagedCacheManager *manager = new PagedCacheManager();
+
+        // 设置基本属性
+        manager->type = type;
+
+        // 从 cacheData 中提取信息
+        // cacheData 的尺寸应该是 [numHeads, seqLen, headDim] 或类似的形状
+        AssertInFastLLM(cacheData.dims.size() >= 2, 
+            "AllocatePagedCacheManager: cacheData should have at least 2 dimensions.\n");
+        int numHeads = cacheData.dims[0];
+        int headDim = cacheData.dims.back();
+        DataType dataType = cacheData.dataType;
+
+        // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
+        ((Data*)manager)->dataType = dataType;
+        ((Data*)manager)->UpdateUnitSize();
+
+        // 根据设备类型设置默认 maxPages
+        if (maxPages <= 0) {
+            int globalMaxTokens = GetMaxTokens();
+            if (globalMaxTokens > 0 && pageLen > 0) {
+                maxPages = globalMaxTokens / pageLen + 1;
+            } else {
+                maxPages = 300;
+            }
+        }
+
+        // 初始化 pagedKVCacheData
+        ((Data*)manager)->directMemory = true;
+        ((Data*)manager)->ToDevice(cacheData.dataDevice);
+
+        // Resize manager: [maxPages, pageLen, numHeads, headDim]
+        ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
+        ((Data*)manager)->Allocate();
+
+        // 初始化 pageLen 和 unusedPageIndex
+        manager->pageLen = pageLen;
+        manager->SetMaxPages(maxPages);
+
+        // 记录到静态 map 中
+        layerPagedCacheManagers[layerIndex] = manager;
+
+        return manager;
+    }
+
+    void ClearAllPagedCacheManagers() {
+        for (auto &it : layerPagedCacheManagers) {
+            it.second->FreeSpace();
+            delete it.second;
+        }
+        layerPagedCacheManagers.clear();
+    }
+
+    void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input) {
+        curExecutor->Run("AppendPagedCache", {
+                {"pagedCacheManager", (Data*)&pagedCacheManager}, {"cache", &cache}, {"input", (Data*)&input}
+        }, {}, {});
+    }
+
+    void GenerateAppendPagedCacheBatchParams(PagedCacheManager &pagedCacheManager,
+        const std::vector<Data*> &pastKeys, int batch,
+        Data &insertIndexs, Data &insertPositions) {
+        curExecutor->Run("GenerateAppendPagedCacheBatchParams", {
+            {"pagedCacheManager", (Data*)&pagedCacheManager},
+            {"pastKeys", (Data*)pastKeys.data()},
+            {"insertIndexs", &insertIndexs},
+            {"insertPositions", &insertPositions}
+        }, {}, {
+            {"batch", batch},
+            {"pastKeys___batch", (int)pastKeys.size()},
+        });
+    }
+
+    // 将input中的数据插入到pagedCacheManager中, 用于decode，每个batch的seqlen都是1
+    // pagedCacheManager: PagedCacheManager
+    // currentCaches: batch个caches的列表，每个元素是一个Data*
+    // input: 输入数据，维度为[batch, num_heads, head_dim]
+    // insertIndexs: 是INT32PARAM，长度为(batch), 第i个询问的插入的page id为insertIndexs[i]
+    // insertPositions: 是INT32PARAM，长度为(batch), 第i个询问的插入位置为insertPositions[i]
+    void AppendPagedCacheBatch(PagedCacheManager &pagedCacheManager, const std::vector<Data*> &currentCaches, const Data &input, 
+        Data &insertIndexs, Data &insertPositions) {
+        curExecutor->Run("AppendPagedCacheBatch", {
+            {"pagedCacheManager", (Data*)&pagedCacheManager},
+            {"currentCaches", (Data*)currentCaches.data()},
+            {"input", (Data*)&input},
+            {"insertIndexs", &insertIndexs},
+            {"insertPositions", &insertPositions}
+        }, {}, {
+            {"currentCaches___batch", (int)currentCaches.size()}
+        });
+    }
+
+    void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
+        int group, float scale, int attentionType, bool inited) {
+        curExecutor->Run("AttentionPaged", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v}, {"output", &output}
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}});
+    }
+
+    // 这里一般都是Decode部分，q中所有batch的seqlen都是1
+    // kCaches, vCaches: 总的PagedKVCache
+    // qSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问位于q的[qSizes[i], qSizes[i+1])范围内
+    // pageSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问缓存于pageIndexs[pageSizes[i] : pageSizes[i + 1]]
+    // pageIndexs: 是INT32PARAM，长度为所有询问使用的pages数目之和
+    // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
+    void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
+        const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
+        Data &output, int group, float scale, int attentionType, bool inited) {
+        curExecutor->Run("AttentionPagedBatch", {
+            {"q", (Data*)&q}, {"kCaches", (Data*)&kCaches}, {"vCaches", (Data*)&vCaches}, {"output", &output},
+            {"qSizes", (Data*)&qSizes}, {"pageSizes", (Data*)&pageSizes}, {"pageIndexs", (Data*)&pageIndexs}, {"lastPageLens", (Data*)&lastPageLens}
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}});
+    }
+
+    // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens
+    // pastKeys: batch个pastKey的列表，每个元素是一个Data*
+    // q: query数据，维度为[num_heads, batch, head_dim]
+    // batch: 批量大小
+    // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
+    void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
+        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens,
+        const std::vector<int> &seqLens) {
+        std::map<std::string, int> intParams = {
+            {"batch", batch}, 
+            {"pastKeys___batch", (int)pastKeys.size()}
+        };
+        // 将 seqLens 编码到 intParams 中，供设备端实现使用
+        intParams["seqLens___size"] = (int)seqLens.size();
+        for (int i = 0; i < (int)seqLens.size(); i++) {
+            intParams["seqLens___" + std::to_string(i)] = seqLens[i];
+        }
+        curExecutor->Run("GeneratePagedBatchParams", {
+            {"q", (Data*)&q}, 
+            {"pastKeys", (Data*)pastKeys.data()}, 
+            {"qSizes", &qSizes}, 
+            {"pageSizes", &pageSizes}, 
+            {"pageIndexs", &pageIndexs}, 
+            {"lastPageLens", &lastPageLens}
+        }, {}, intParams);
+    }
+
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
                    std::map <std::string, std::string> loraConfig) {
         float r = std::atof(loraConfig["r"].c_str());
@@ -2894,6 +3674,14 @@ namespace fastllm {
         }
     }
 
+    void *GetExecutor() {
+        return (void*)curExecutor;
+    }
+
+    bool HasDeviceType(const std::string &deviceType) {
+        return curExecutor->HasDevice(deviceType);
+    }
+
     void ClearProfiler() {
         curExecutor->ClearProfiler();
     }
@@ -2928,5 +3716,335 @@ namespace fastllm {
 
     std::map <std::string, int> GetDeviceMap() {
         return defaultDeviceMap;
+    }
+
+    void SetMoeDeviceMap(const std::map <std::string, int> &deviceMap) {
+        defaultMoeDeviceMap = deviceMap;
+    }
+
+    std::map <std::string, int> GetMoeDeviceMap() {
+        return defaultMoeDeviceMap;
+    }
+
+    void PagedCacheManager::SetMaxPages(int maxPages) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->maxPages = maxPages;
+        this->freePages.clear();
+        this->triePages.clear();
+        this->freePagesSet.clear();
+        this->triePagesSet.clear();
+        this->freePages.reserve(maxPages);
+        this->freePagesSet.reserve(maxPages);
+        for (int i = 0; i < maxPages; i++) {
+            this->freePages.push_back(i);
+            this->freePagesSet.insert(i);
+        }
+        this->pageTimestamp.assign(maxPages, 0);
+        this->pageRefCount.assign(maxPages, 0);
+        this->currentTimestamp = 0;
+        this->pageToTrieNode.clear();
+        if (this->trieRoot) {
+            // 简单起见，不递归删除旧树节点（在生命周期内 SetMaxPages 通常只调用一次）
+        }
+        this->trieRoot = new CacheTrieNode();
+    }
+
+    // 从 Trie 中移除一个叶子节点，断开父子关系并清理映射
+    static void RemoveTrieLeaf(CacheTrieNode *node, int pageIndex,
+                               std::unordered_map<int, CacheTrieNode*> &pageToTrieNode) {
+        if (node->parent) {
+            node->parent->children.erase(node->edgeHash);
+        }
+        pageToTrieNode.erase(pageIndex);
+        delete node;
+    }
+
+    // 递归删除 Trie 子树中所有节点，将其关联的页面迁移回 freePages
+    void PagedCacheManager::EvictTrieSubtree(CacheTrieNode *node) {
+        // 先递归处理所有子节点
+        for (auto &kv : node->children) {
+            EvictTrieSubtree(kv.second);
+        }
+        int pid = node->pageId;
+        if (pid >= 0) {
+            this->pageToTrieNode.erase(pid);
+            // 如果页面空闲（在 triePagesSet 中），迁移到 freePages
+            if (this->triePagesSet.erase(pid)) {
+                this->freePagesSet.insert(pid);
+                this->freePages.push_back(pid);
+            }
+        }
+        delete node;
+    }
+
+    int PagedCacheManager::GetUnusedPageIndex(bool pick) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+
+        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
+        while (this->freePages.empty() && !this->triePages.empty()) {
+            int candidate = this->triePages.back();
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                // 页面已不在 Trie 中，迁移到 freePages
+                this->triePages.pop_back();
+                this->triePagesSet.erase(candidate);
+                this->freePages.push_back(candidate);
+                this->freePagesSet.insert(candidate);
+            } else {
+                break;
+            }
+        }
+
+        if (this->freePages.empty() && this->triePages.empty()) {
+            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
+        }
+
+        int pageIndex;
+        if (!this->freePages.empty()) {
+            pageIndex = this->freePages.back();
+            if (pick) {
+                this->freePages.pop_back();
+                this->freePagesSet.erase(pageIndex);
+                this->pageRefCount[pageIndex] = 1;
+            }
+        } else {
+            if (!pick) {
+                pageIndex = this->triePages.back();
+                return pageIndex;
+            }
+
+            // pick 模式：从 triePages 中淘汰，优先选叶子节点
+            pageIndex = -1;
+            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
+                int candidate = this->triePages[i];
+                auto it = this->pageToTrieNode.find(candidate);
+                if (it == this->pageToTrieNode.end()) {
+                    // stale 条目：页面已不在 Trie 中，直接用
+                    pageIndex = candidate;
+                    this->triePages[i] = this->triePages.back();
+                    this->triePages.pop_back();
+                    this->triePagesSet.erase(pageIndex);
+                    break;
+                }
+                if (it->second->children.empty()) {
+                    pageIndex = candidate;
+                    this->triePages[i] = this->triePages.back();
+                    this->triePages.pop_back();
+                    this->triePagesSet.erase(pageIndex);
+                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
+                    break;
+                }
+            }
+
+            if (pageIndex == -1) {
+                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
+                pageIndex = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                auto it = this->pageToTrieNode.find(pageIndex);
+                if (it != this->pageToTrieNode.end()) {
+                    CacheTrieNode *node = it->second;
+                    for (auto &childKv : node->children) {
+                        EvictTrieSubtree(childKv.second);
+                    }
+                    node->children.clear();
+                    if (node->parent) {
+                        node->parent->children.erase(node->edgeHash);
+                    }
+                    this->pageToTrieNode.erase(it);
+                    delete node;
+                }
+                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
+                // 过滤 triePages 中已不在 triePagesSet 的脏条目
+                int w = 0;
+                for (int i = 0; i < (int)this->triePages.size(); i++) {
+                    if (this->triePagesSet.count(this->triePages[i])) {
+                        this->triePages[w++] = this->triePages[i];
+                    }
+                }
+                this->triePages.resize(w);
+            }
+
+            this->pageRefCount[pageIndex] = 1;
+        }
+        return pageIndex;
+    }
+
+    void PagedCacheManager::ReleasePageIndex(int pageIndex) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->pageRefCount[pageIndex]--;
+        if (this->pageRefCount[pageIndex] <= 0) {
+            this->pageRefCount[pageIndex] = 0;
+            if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
+                if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
+                    this->triePages.push_back(pageIndex);
+                    this->triePagesSet.insert(pageIndex);
+                }
+            } else {
+                if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
+                    this->freePages.push_back(pageIndex);
+                    this->freePagesSet.insert(pageIndex);
+                }
+            }
+        }
+    }
+
+    void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        for (int pageIndex : pageIndices) {
+            this->pageRefCount[pageIndex]--;
+            if (this->pageRefCount[pageIndex] <= 0) {
+                this->pageRefCount[pageIndex] = 0;
+                if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
+                    if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
+                        this->triePages.push_back(pageIndex);
+                        this->triePagesSet.insert(pageIndex);
+                    }
+                } else {
+                    if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
+                        this->freePages.push_back(pageIndex);
+                        this->freePagesSet.insert(pageIndex);
+                    }
+                }
+            }
+        }
+    }
+
+    void PagedCacheManager::Pick(std::vector<int> &pageIds) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        bool needRebuildFree = false, needRebuildTrie = false;
+        for (int pageIndex : pageIds) {
+            this->pageRefCount[pageIndex]++;
+            if (this->freePagesSet.erase(pageIndex)) {
+                needRebuildFree = true;
+            } else if (this->triePagesSet.erase(pageIndex)) {
+                needRebuildTrie = true;
+            }
+        }
+        if (needRebuildFree) {
+            int w = 0;
+            for (int i = 0; i < (int)this->freePages.size(); i++) {
+                if (this->freePagesSet.count(this->freePages[i])) {
+                    this->freePages[w++] = this->freePages[i];
+                }
+            }
+            this->freePages.resize(w);
+        }
+        if (needRebuildTrie) {
+            int w = 0;
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                if (this->triePagesSet.count(this->triePages[i])) {
+                    this->triePages[w++] = this->triePages[i];
+                }
+            }
+            this->triePages.resize(w);
+        }
+    }
+
+    uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {
+        uint64_t hash = 0;
+        const uint64_t P = 1000000007ULL;
+        for (int i = 0; i < len; i++) {
+            hash = hash * P + (uint64_t)tokens[i];
+        }
+        return hash;
+    }
+
+    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->currentTimestamp++;
+        long long ts = this->currentTimestamp;
+
+        int numPages = (int)tokens.size() / this->pageLen;
+        if ((int)pages.size() < numPages) {
+            numPages = (int)pages.size();
+        }
+
+        CacheTrieNode *cur = this->trieRoot;
+        for (int i = 0; i < numPages; i++) {
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            int pid = pages[i];
+
+            auto it = cur->children.find(h);
+            CacheTrieNode *child;
+            if (it == cur->children.end()) {
+                child = new CacheTrieNode();
+                child->parent = cur;
+                child->edgeHash = h;
+                cur->children[h] = child;
+            } else {
+                child = it->second;
+                if (child->pageId != -1 && child->pageId != pid) {
+                    int oldPid = child->pageId;
+                    this->pageToTrieNode.erase(oldPid);
+                    // 旧页面如果空闲，从 triePages 迁移到 freePages
+                    if (this->triePagesSet.erase(oldPid)) {
+                        for (int j = (int)this->triePages.size() - 1; j >= 0; j--) {
+                            if (this->triePages[j] == oldPid) {
+                                this->triePages[j] = this->triePages.back();
+                                this->triePages.pop_back();
+                                break;
+                            }
+                        }
+                        this->freePages.push_back(oldPid);
+                        this->freePagesSet.insert(oldPid);
+                    }
+                }
+            }
+
+            // 新页面加入 Trie：如果它在 freePages 中（空闲且不在 Trie 中），迁移到 triePages
+            if (this->pageToTrieNode.find(pid) == this->pageToTrieNode.end()) {
+                if (this->freePagesSet.erase(pid)) {
+                    for (int j = (int)this->freePages.size() - 1; j >= 0; j--) {
+                        if (this->freePages[j] == pid) {
+                            this->freePages[j] = this->freePages.back();
+                            this->freePages.pop_back();
+                            break;
+                        }
+                    }
+                    if (this->pageRefCount[pid] <= 0) {
+                        this->triePages.push_back(pid);
+                        this->triePagesSet.insert(pid);
+                    }
+                }
+            }
+
+            child->pageId = pid;
+            child->timestamp = ts;
+            this->pageTimestamp[pid] = ts;
+            this->pageToTrieNode[pid] = child;
+
+            cur = child;
+        }
+    }
+
+    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        cachedPageIds.clear();
+
+        int numPages = (int)tokens.size() / this->pageLen;
+        CacheTrieNode *cur = this->trieRoot;
+
+        for (int i = 0; i < numPages; i++) {
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+
+            auto it = cur->children.find(h);
+            if (it == cur->children.end()) {
+                break;
+            }
+
+            CacheTrieNode *child = it->second;
+            if (child->pageId == -1) {
+                break;
+            }
+
+            // 验证时间戳：页面未被覆盖
+            if (this->pageTimestamp[child->pageId] != child->timestamp) {
+                break;
+            }
+
+            cachedPageIds.push_back(child->pageId);
+            cur = child;
+        }
     }
 }

@@ -5,7 +5,8 @@
 #ifndef FASTLLM_TEMPLATE_H
 #define FASTLLM_TEMPLATE_H
 
-#include "utils.h"
+#include "utils/utils.h"
+#include <functional>
 
 namespace fastllm {
     struct JinjaVar {
@@ -15,8 +16,8 @@ namespace fastllm {
         };
 
         JinjaVarType type = JinjaNone;
-        long long intValue;
-        float floatValue;
+        long long intValue = 0LL;
+        float floatValue = 0.0f;
         std::string stringValue;
         std::vector <JinjaVar> arrayValue;
         std::map <std::string, JinjaVar> dictValue;
@@ -49,13 +50,14 @@ namespace fastllm {
     // 词法分析后的Token
     struct JinjaToken {
         enum JinjaToKenType {
-            JinjaTokenID = 0, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT, 
+            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenFUNC, JinjaTokenDOT,
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
-            JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenEndif,
+            JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
-            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv,
+            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenLess, JinjaTokenLessEqual, JinjaTokenMore, JinjaTokenMoreEqual,
+            JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
-            JinjaTokenFliter
+            JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice
         };
 
         JinjaToKenType type;
@@ -74,7 +76,10 @@ namespace fastllm {
             {'-', JinjaToken::JinjaToKenType::JinjaTokenSub},
             {'*', JinjaToken::JinjaToKenType::JinjaTokenMul},
             {'/', JinjaToken::JinjaToKenType::JinjaTokenDiv},
-            {'|', JinjaToken::JinjaToKenType::JinjaTokenFliter}
+            {'%', JinjaToken::JinjaToKenType::JinjaTokenMod},
+            {'|', JinjaToken::JinjaToKenType::JinjaTokenFilter},
+            {',', JinjaToken::JinjaToKenType::JinjaTokenNamespace},
+            {':', JinjaToken::JinjaToKenType::JinjaTokenSlice}
     };
 
     static std::map <char, char> escapeChars = {
@@ -86,19 +91,25 @@ namespace fastllm {
             {"for", JinjaToken::JinjaToKenType::JinjaTokenFor},
             {"endfor", JinjaToken::JinjaToKenType::JinjaTokenEndFor},
             {"if", JinjaToken::JinjaToKenType::JinjaTokenIf},
+            {"elif", JinjaToken::JinjaToKenType::JinjaTokenElseIf},
             {"else", JinjaToken::JinjaToKenType::JinjaTokenElse},
             {"endif", JinjaToken::JinjaToKenType::JinjaTokenEndif},
             {"set", JinjaToken::JinjaToKenType::JinjaTokenSet},
             {"in", JinjaToken::JinjaToKenType::JinjaTokenIn},
+            {"is", JinjaToken::JinjaToKenType::JinjaTokenEqual},
+            {"true", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
+            {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
             {"or", JinjaToken::JinjaToKenType::JinjaTokenOr},
+            {"not", JinjaToken::JinjaToKenType::JinjaTokenNot},
+            {"namespace", JinjaToken::JinjaToKenType::JinjaTokenNamespace}
     };
 
-    // 一个Jinja块
+    // 一个Jinja块 
     struct JinjaBlock {
         enum JinjaBlockType {
             JinjaBlockOriginal = 0, JinjaBlockEmpty, JinjaBlockVar, JinjaBlockFor, 
-            JinjaBlockEndFor, JinjaBlockIf, JinjaBlockElse, JinjaBlockEndIf,
+            JinjaBlockEndFor, JinjaBlockIf, JinjaBlockElseIf, JinjaBlockElse, JinjaBlockEndIf,
             JinjaBlockSet
         };
 
@@ -125,6 +136,8 @@ namespace fastllm {
 
     int GetOpLevel(JinjaToken::JinjaToKenType type);
 
+    using JinjaFunction = std::function<JinjaVar(const JinjaVar &)>;
+
     // Jinja模板
     struct JinjaTemplate {
         std::string temp;
@@ -134,7 +147,7 @@ namespace fastllm {
 
         JinjaTemplate (const std::string &temp);
 
-        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end);
+        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue = nullptr);
 
         void Parse(int st, int end, JinjaVar &var, std::string &ret);
 

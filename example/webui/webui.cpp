@@ -1,8 +1,8 @@
 // Provide by Jacques CHEN (http://whchen.net/index.php/About.html)
 // HTML file reference from ChatGLM-MNN （https://github.com/wangzhaode/ChatGLM-MNN)
 
-#include "model.h"
 #include "httplib.h"
+#include "model.h"
 
 #include <cstdio>
 #include <cstring>
@@ -12,21 +12,37 @@
 #include <string>
 #include <mutex>
 
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
+
 struct WebConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string webPath = "web"; // 网页文件路径
+    std::string systemPrompt = "You are a helpful assistant.";
     int threads = 4; // 使用的线程数
     bool lowMemMode = false; // 是否使用低内存模式
     int port = 8081; // 端口号
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    int groupCnt = -1;
 };
 
 void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-    std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
 }
 
@@ -45,6 +61,17 @@ void ParseArgs(int argc, char **argv, WebConfig &config) {
             config.threads = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-l" || sargv[i] == "--low") {
             config.lowMemMode = true;
+        } else if (sargv[i] == "--system") {
+            config.systemPrompt = sargv[++i];
+        } else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "-w" || sargv[i] == "--web") {
             config.webPath = sargv[++i];
         } else if (sargv[i] == "--port") {
@@ -57,10 +84,9 @@ void ParseArgs(int argc, char **argv, WebConfig &config) {
 }
 
 struct ChatSession {
-    std::string history = "";
+    fastllm::ChatMessages messages;
     std::string input = "";
     std::string output = "";
-    int round = 0;
     int status = 0; // 0: 空闲 1: 结果生成好了 2: 已经写回了
 };
 
@@ -73,17 +99,23 @@ int main(int argc, char** argv) {
 
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    auto model = fastllm::CreateLLMModelFromFile(config.path);
+    if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    auto model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
+        : fastllm::CreateLLMModelFromFile(config.path);
 
     httplib::Server svr;
     auto chat = [&](ChatSession *session, const std::string input) {
         if (input == "reset" || input == "stop") {
-            session->history = "";
-            session->round = 0;
+            session->messages.erase(std::next(session->messages.begin()), session->messages.end());
             session->output = "<eop>\n";
             session->status = 2;
         } else {
-            auto prompt = model->MakeInput(session->history, session->round, input);
+            session->messages.push_back(std::make_pair("user", input));
+            auto prompt = model->ApplyChatTemplate(session->messages);
             auto inputs = model->weight.tokenizer.Encode(prompt);
 
             std::vector<int> tokens;
@@ -106,7 +138,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            session->history = model->MakeHistory(session->history, session->round++, input, session->output);
+            session->messages.push_back(std::make_pair("assistant", session->output));
             session->output += "<eop>\n";
             session->status = 2;
         }
@@ -117,6 +149,8 @@ int main(int argc, char** argv) {
         locker.lock();
         if (sessions.find(uuid) == sessions.end()) {
             sessions[uuid] = new ChatSession();
+            if (!config.systemPrompt.empty())
+                sessions[uuid]->messages.push_back({"system", config.systemPrompt});
         }
         auto *session = sessions[uuid];
         locker.unlock();

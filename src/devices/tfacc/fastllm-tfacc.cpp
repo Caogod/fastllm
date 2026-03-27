@@ -25,6 +25,8 @@ namespace fastllm {
 
         AppendKVCache = 6,
         DoAttention = 7,
+        MOEInt4NoZero = 8,
+        MOEInt4Group = 9,
 
         GetComputeServerInfo = 10000,
         StartLongData = 10001,
@@ -166,7 +168,7 @@ namespace fastllm {
             int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
             for (int i = 0; i < k; i++) {
                 buffer.WriteFloat(data->perChannelsConfigs[i].min);
-                buffer.WriteFloat(data->perChannelsConfigs[i].max);
+                buffer.WriteFloat(dataType == DataType::INT4_NOZERO ? data->perChannelsConfigs[i].scale : data->perChannelsConfigs[i].max);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
         } else if (dataType == DataType::INT4_GROUP) {
@@ -187,6 +189,16 @@ namespace fastllm {
         /// TODO: data->clear()
         delete[] data->cpuData;
         data->cpuData = new uint8_t[1];
+        // data->weightSum.clear();
+        data->mins.clear();
+        data->scales.clear();
+        data->zeros.clear();
+        data->perChannelsConfigs.clear();
+
+        data->mins.shrink_to_fit();
+        data->scales.shrink_to_fit();
+        data->zeros.shrink_to_fit();
+        data->perChannelsConfigs.shrink_to_fit();
     }
 
     void TfaccClient::UnregisterFastllmData(const std::string &dataName) {
@@ -211,7 +223,8 @@ namespace fastllm {
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
                                      uint8_t *uinput, float *output, 
-                                     LinearExType exType) {
+                                     LinearExType exType, 
+                                     DataType outputType) {
         std::string linearType = "linear";
         if (exType == LinearExType::ExSwiglu) {
             linearType = "linearSwiglu";
@@ -235,6 +248,7 @@ namespace fastllm {
         maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
 
         // printf("maxN = %d\n", maxN);
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         for (int baseN = 0; baseN < n; baseN += maxN) {
 // auto st0 = std::chrono::system_clock::now();
             int curN = std::min(maxN, n - baseN);
@@ -246,6 +260,7 @@ namespace fastllm {
             ((int32_t*)buf)[5] = weight->name.size();
             ((int32_t*)buf)[6] = biasName.size();
             ((int32_t*)buf)[7] = exType;
+            ((int32_t*)buf)[8] = outputType;
             
             volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
             for (int i = 0; i < curN * group; i++) {
@@ -269,9 +284,9 @@ namespace fastllm {
 
             auto pool = GetAlivePool();
 
-            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * outK * sizeof(int32_t),
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * outK * outputUnitSize,
                     (uint8_t*) result,
-                    curN * outK * sizeof(int32_t), GetAlivePool());
+                    curN * outK * outputUnitSize, GetAlivePool());
 // auto st3 = std::chrono::system_clock::now();
 // if (n > 0) printf("n = %d, m = %d, k = %d, input = %f s, calc = %f s, output = %f. total = %f\n", n, m, k, GetSpan(st0, st1), GetSpan(st1, st2), GetSpan(st2, st3), GetSpan(st0, st3));
         }
@@ -329,6 +344,91 @@ namespace fastllm {
                 outK /= 2;
             }
             memcpy(((uint8_t*) output) + baseN * outK * unitSize, (uint8_t*) result, curN * outK * unitSize);
+        }
+    }
+
+    void TfaccClient::RunTfaccMOEU(int n, int m, int k, int group, int groupCnt,
+                        std::vector <fastllm::Data*> weights, std::vector <float> factors,
+                        std::vector <LowBitConfig> *inputConfigs,
+                        uint8_t *uinput, float *output, 
+                        DataType outputType) {
+        if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+            for (int i = 0; i < weights.size(); i += 2) {
+                RegisterFastllmData(weights[i], "linearSwiglu");
+                RegisterFastllmData(weights[i + 1], "linearColumn");
+            }
+        }
+        int opType = ComputeTaskType::MOEInt4NoZero;
+        /*if (weights[0]->dataType == DataType::INT8) {
+            opType = ComputeTaskType::LinearInt8;
+        }
+        if (weight->dataType == DataType::INT4_GROUP) {
+            opType = ComputeTaskType::LinearInt4Group;
+        }*/
+
+
+        int maxN = n;
+        maxN = std::min(maxN, transLimit / m);
+        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+
+        // printf("maxN = %d\n", maxN);
+        std::string factorString = "[", weightString = "[";
+        for (int i = 0; i < factors.size(); i++) {
+            if (i > 0) {
+                factorString += ",\n";
+            }
+            factorString += std::to_string(factors[i]);
+        }
+        for (int i = 0; i < weights.size(); i++) {
+            if (i > 0) {
+                weightString += ",\n";
+            }
+            weightString += ('\"') + weights[i]->name + ('\"');
+        }
+        factorString += "]";
+        weightString += "]";
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+        
+maxN = 1;
+        for (int baseN = 0; baseN < n; baseN += maxN) {
+// auto st0 = std::chrono::system_clock::now();
+            int curN = std::min(maxN, n - baseN);
+            std::string configString = "{";
+            configString += "\"factors\":" +  factorString + ",";
+            configString += "\"group\":" +  std::to_string(group) + ",";
+            configString += "\"groupCnt\":" +  std::to_string(groupCnt) + ",";
+            configString += "\"n\":" +  std::to_string(n) + ",";
+            configString += "\"m\":" +  std::to_string(m) + ",";
+            configString += "\"k\":" +  std::to_string(k) + ",";
+            configString += "\"op\":\"moe\",";
+            configString += "\"outputType\":" +  std::to_string(0) + ",";
+            configString += "\"weights\":" +  weightString + "}";
+            U8Buffer buffer;
+            buffer.WriteInt(configString.size());
+            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+            std::vector <float> minmaxs;
+            for (int i = 0; i < curN * group; i++) {
+                minmaxs.push_back((*inputConfigs)[baseN * group + i].min);
+                minmaxs.push_back((*inputConfigs)[baseN * group + i].max);
+            }
+            RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)minmaxs.data(), minmaxs.size() * sizeof(float), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size() + minmaxs.size() * sizeof(float), (uint8_t*)uinput + baseN * m, curN * m, GetAlivePool());
+            this->Launch(opType);
+            this->Wait();
+            auto pool = GetAlivePool();
+
+            uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
+            RunMultiThreadMemcpy(oriResult, (uint8_t*)result, serverNumaCnt * curN * k * outputUnitSize, GetAlivePool());
+            float *floatResult = (float*)oriResult;
+            for (int i = 1; i < serverNumaCnt; i++) {
+                for (int j = 0; j < curN * k; j++) {
+                    floatResult[j] += floatResult[i * curN * k + j];
+                }
+            }
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) oriResult,
+                    curN * k * outputUnitSize, GetAlivePool());
+            delete[] oriResult;
         }
     }
 

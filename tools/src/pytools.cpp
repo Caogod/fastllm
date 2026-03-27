@@ -5,6 +5,7 @@
 #include "model.h"
 
 #include <cstring>
+#include <csignal>
 
 #ifdef WIN32
 #define DLL_EXPORT _declspec(dllexport)
@@ -12,9 +13,28 @@
 #define DLL_EXPORT
 #endif
 
+#include "pytools_t2s.cpp"
+
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        printf("into exit\n");
+        exit(0);
+    }
+}
+
+struct FASTLLM_PYTOOLS_INIT {
+    FASTLLM_PYTOOLS_INIT () {
+        std::signal(SIGINT, signal_handler);
+    }
+} fastllm_pytools_init;
+
 extern "C" {
     DLL_EXPORT void print_cpu_ins() {
         fastllm::PrintInstructionInfo();
+    }
+
+    DLL_EXPORT bool has_device(char *deviceType) {
+        return fastllm::HasDeviceType(std::string(deviceType));
     }
 
     DLL_EXPORT void set_cpu_threads(int threads) {
@@ -29,6 +49,30 @@ extern "C" {
         fastllm::SetLowMemMode(low);
     }
 
+    DLL_EXPORT void set_cuda_embedding(bool cuda_embedding) {
+        fastllm::SetCudaEmbedding(cuda_embedding);
+    }
+
+    DLL_EXPORT void set_cuda_shared_expert(bool cuda_shared_expert) {
+        fastllm::SetCudaSharedExpert(cuda_shared_expert);
+    }
+
+    DLL_EXPORT void set_enable_amx(bool enable_amx) {
+        fastllm::EnableAMX(enable_amx);
+    }
+
+    DLL_EXPORT void set_max_tokens(int max_tokens) {
+        fastllm::SetMaxTokens(max_tokens);
+    }
+
+    DLL_EXPORT void set_page_size(int page_size) {
+        fastllm::SetPageLen(page_size);
+    }
+
+    DLL_EXPORT void set_gpu_mem_ratio(float ratio) {
+        fastllm::SetGpuMemRatio(ratio);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
@@ -39,6 +83,14 @@ extern "C" {
 
     DLL_EXPORT bool get_kvcache_in_cpu() {
         return fastllm::GetKVCacheInCPU();
+    }
+
+    DLL_EXPORT void set_historycache_in_cpu(bool in) {
+        fastllm::SetHistoryCacheInCPU(in);
+    }
+
+    DLL_EXPORT bool get_historycache_in_cpu() {
+        return fastllm::GetHistoryCacheInCPU();
     }
 
     DLL_EXPORT void set_device_map(int device_cnt, int *lens, char *devices, int *values) {
@@ -52,6 +104,19 @@ extern "C" {
             deviceMap[key] = values[i];
         }
         fastllm::SetDeviceMap(deviceMap);
+    }
+
+    DLL_EXPORT void set_moe_device_map(int device_cnt, int *lens, char *devices, int *values) {
+        std::map <std::string, int> deviceMap;
+        int cur = 0;
+        for (int i = 0; i < device_cnt; i++) {
+            std::string key = "";
+            for (int j = 0; j < lens[i]; j++) {
+                key += devices[cur++];
+            }
+            deviceMap[key] = values[i];
+        }
+        fastllm::SetMoeDeviceMap(deviceMap);
     }
 
     DLL_EXPORT struct ModelManager {
@@ -75,10 +140,11 @@ extern "C" {
         return svalue;
     }
 
-    DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, bool do_sample, float top_p, int top_k,
-                                          float temperature, float repeat_penalty, bool output_logits) {
+    DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                          float temperature, float repeat_penalty, bool output_logits, bool add_special_tokens) {
         fastllm::GenerationConfig config;
         config.output_token_limit = max_length;
+        config.output_token_least = min_length;
         config.temperature = temperature;
         config.repeat_penalty = repeat_penalty;
         if (do_sample) {
@@ -86,6 +152,7 @@ extern "C" {
             config.top_k = top_k;
         }
         config.output_logits = output_logits;
+        config.add_special_tokens = add_special_tokens;
         return config;
     }
 
@@ -97,10 +164,46 @@ extern "C" {
         return id;
     }
 
-    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt) {
+    DLL_EXPORT void export_llm_model_fromhf(char *path, int dataType, int groupCnt, char *lora, char *outputPath, 
+                                            bool useMoe, int moeDataType, int moeGroupCnt, char *dtypeConfigString) {
+        models.locker.lock();
+        fastllm::ExportLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, outputPath, "", lora, 
+                        useMoe, (fastllm::DataType)moeDataType, moeGroupCnt, dtypeConfigString);
+        models.locker.unlock();
+        return;
+    }
+
+    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer, char *lora, 
+                                        bool useMoe, int moeDataType, int moeGroupCnt, char *dtypeConfigString) {
         models.locker.lock();
         int id = models.models.size();
-        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt);
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, "", lora, 
+                            false, useMoe, (fastllm::DataType)moeDataType, moeGroupCnt, dtypeConfigString);
+        models.locker.unlock();
+        return id;
+    }
+
+    DLL_EXPORT int create_llm_model_fromhf_with_config(char *path, int dataType, int groupCnt, bool skipTokenizer, char *config) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, (std::string)config);
+        models.locker.unlock();
+        return id;
+    }
+
+    DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
+        models.locker.lock();
+        fastllm::SetCudaSharedExpert(true);
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromGGUFFile(path, oriPath);
+        models.locker.unlock();
+        return id;
+    }
+
+    DLL_EXPORT int create_llm_tokenizer_fromhf(char *path) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMTokenizerFromHF(path);
         models.locker.unlock();
         return id;
     }
@@ -204,6 +307,84 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_moe_experts(int modelId, int moe_experts) {
+        auto model = models.GetModel(modelId);
+        model->SetMoeExperts(moe_experts);
+        return;
+    }
+
+    DLL_EXPORT void set_model_moe_atype(int modelId, char *moe_atype) {
+        auto model = models.GetModel(modelId);
+        std::string atypeStr = moe_atype;
+        if (atypeStr == "float16" || atypeStr == "half") {
+            model->SetMoeAtype(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
+            model->SetMoeAtype(fastllm::DataType::BFLOAT16);
+        } else if (atypeStr == "float" || atypeStr == "float32" || atypeStr == "" || atypeStr == "auto") {
+            model->SetMoeAtype(fastllm::DataType::FLOAT32);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32, float16 or bfloat16.");
+        }
+        return;
+    }
+
+    DLL_EXPORT void set_model_atype(int modelId, char *atype) {
+        auto model = models.GetModel(modelId);
+        std::string atypeStr = atype;
+        if (atypeStr == "auto") {
+#ifdef USE_ROCM
+            model->SetDataType(fastllm::DataType::FLOAT32);
+#else
+            if (model->use_new_engine
+                || model->model_struct == "chatglm" 
+                || model->model_struct == "llama"
+                || model->model_struct == "qwen3_moe"
+                || model->model_struct == "minimax_m2"
+                // || this->model_struct == "graph" ||
+                // || this->model_struct == "cogvlm" ||
+                 || model->model_struct == "deepseek_v2"
+                 || model->model_struct == "hunyuan"
+                 || model->model_struct == "ernie4_5"
+                 || model->model_struct == "pangu_moe"
+                 || model->model_struct == "glm4_moe"
+                ) {
+                model->SetDataType(fastllm::DataType::FLOAT16);
+            } else {
+                model->SetDataType(fastllm::DataType::FLOAT32);
+            }
+#endif
+        } else if (atypeStr == "float16" || atypeStr == "half") {
+            model->SetDataType(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
+            model->SetDataType(fastllm::DataType::BFLOAT16);
+        } else if (atypeStr == "float" || atypeStr == "float32") {
+            model->SetDataType(fastllm::DataType::FLOAT32);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32, float16 or bfloat16.");
+        }
+        return;
+    }
+
+    DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
+        auto model = models.GetModel(modelId);
+        std::string dtypeStr = kv_cache_dtype;
+        if (dtypeStr == "" || dtypeStr == "auto") {
+            model->kvCacheDataType = model->dataType;
+            model->useCustomKVCacheDataType = false;
+        } else if (dtypeStr == "float16" || dtypeStr == "half") {
+            model->SetKVCacheDataType(fastllm::DataType::FLOAT16);
+        } else if (dtypeStr == "bfloat16" || dtypeStr == "bf16") {
+            model->SetKVCacheDataType(fastllm::DataType::BFLOAT16);
+        } else if (dtypeStr == "float" || dtypeStr == "float32") {
+            model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
+        } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
+            model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+        }
+        return;
+    }
+
     DLL_EXPORT void init_params_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->InitParams();
@@ -212,7 +393,7 @@ extern "C" {
 
     DLL_EXPORT void warmup_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
-        model->WarmUp();
+        model->AutoWarmup();
         return;
     }
 
@@ -289,13 +470,13 @@ extern "C" {
                                  int max_length, bool do_sample, float top_p, int top_k,
                                  float temperature, float repeat_penalty, bool output_logits) {
         auto model = models.GetModel(modelId);
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
+        auto config = make_config(max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
         std::string s = model->Response(content, nullptr, config);
         return string_to_chars(s);
     }
 
     DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
-                                      int max_length, bool do_sample, float top_p, int top_k,
+                                      int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                       float temperature, float repeat_penalty, bool output_logits,
                                       int stop_token_len, int * stop_token_ids) {
         auto model = models.GetModel(modelId);
@@ -304,12 +485,25 @@ extern "C" {
         for (int i = 0; i < v.Count(0); i++) {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        config.input_token_length = tokens.size();
         for(int i = 0; i < stop_token_len; i++ )
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
         return model->LaunchResponseTokens(tokens, config);
+    }
+
+    // 尝试fetch，如果能fetch成功则返回true（后续需要fetch一下)，用于异步操作
+    DLL_EXPORT bool can_fetch_response_llm_model(int modelId, int handleId) {
+        auto model = models.GetModel(modelId);
+        return model->CanFetchResponse(handleId);
+    }
+
+    // 终止handleId的请求
+    DLL_EXPORT void abort_response_llm_model(int modelId, int handleId) {
+        auto model = models.GetModel(modelId);
+        model->AbortResponse(handleId);
     }
 
     DLL_EXPORT char *fetch_response_str_llm_model(int modelId, int handleId) {
@@ -320,20 +514,55 @@ extern "C" {
     }
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
-                                  int max_length, bool do_sample, float top_p, int top_k,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                   float temperature, float repeat_penalty, bool output_logits,
                                   int stop_token_len, int * stop_token_ids) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
         for(int i = 0; i < stop_token_len; i++ )
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
+        config.input_token_length = input.size();
         auto model = models.GetModel(modelId);
         return model->LaunchResponseTokens(input, config);
+    }
+
+    DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
+                                  char *multimodal_json, float *multimodal_data,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        for(int i = 0; i < stop_token_len; i++ ) {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
+        auto model = models.GetModel(modelId);
+
+        std::string error;
+        auto multimodal_config = json11::Json::parse(multimodal_json, error);
+        int image_channels = multimodal_config["image_channels"].int_value();
+        int image_height = multimodal_config["image_height"].int_value();
+        int image_width = multimodal_config["image_width"].int_value();
+
+        std::vector <float> imageInput;
+        imageInput.resize(1 * image_channels * image_height * image_width);
+        memcpy(&imageInput[0], multimodal_data, imageInput.size() * sizeof(float));
+
+        std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
+        fastllm::Data *imageInputData = new fastllm::Data();
+        imageInputData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, image_channels, image_height, image_width}, imageInput));
+        (*multimodalInput)["images"].push_back(imageInputData);
+
+        int ret = model->LaunchResponseTokens(input, config, *multimodalInput);
+        return ret;
     }
 
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
@@ -349,5 +578,92 @@ extern "C" {
             memcpy(logits, retLogits.data(), retLogits.size() * sizeof(float));
         }
         return ret;
+    }
+
+    DLL_EXPORT void add_cache_llm_model(int modelId, int len, int *values) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto model = models.GetModel(modelId);
+        model->AddPromptCache(input);
+    }
+
+    DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {
+        auto model = models.GetModel(modelId);
+        model->kvCacheLimit = bytes;
+    }
+
+    DLL_EXPORT void set_max_batch_llm_model(int modelId, int batch) {
+        auto model = models.GetModel(modelId);
+        model->maxBatch = batch;
+    }
+
+    DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
+        auto model = models.GetModel(modelId);
+        model->SetChunkedPrefillSize(size);
+    }
+
+    DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {
+        auto model = models.GetModel(modelId);
+        model->verbose = verbose;
+    }
+
+    DLL_EXPORT int get_max_input_len_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        return model->max_positions;
+    }
+
+    DLL_EXPORT char *get_struct_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        char *ret = string_to_chars(model->model_struct);
+        return ret;
+    }
+
+    DLL_EXPORT char *get_type_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        char *ret = string_to_chars(model->model_type);
+        return ret;
+    }
+
+    DLL_EXPORT float* embedding_sentence(int modelId, char *input, bool normalize, int *embeddingLen) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::string str(input);
+        std::vector <float> result = model->EmbeddingSentence(str, normalize);
+        float *fvalue = new float[result.size()];
+        memcpy(fvalue, result.data(), result.size() * sizeof(float));
+        *embeddingLen = result.size();
+        return fvalue;
+    }
+
+    DLL_EXPORT float* embedding_tokens(int modelId, int inputLen, int *input, bool normalize, int *embeddingLen) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::vector <int> tokens;
+        for (int i = 0; i < inputLen; i++) {
+            tokens.push_back(input[i]);
+        }
+        std::vector <float> result = model->EmbeddingSentence(tokens, normalize);
+        float *fvalue = new float[result.size()];
+        memcpy(fvalue, result.data(), result.size() * sizeof(float));
+        *embeddingLen = result.size();
+        return fvalue;
+    }
+
+    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::vector <std::vector <int> > inputIds;
+        inputIds.resize(batch);
+        int pos = 0;
+        for (int i = 0; i < batch; i++) {
+            for (int j = 0; j < seqLens[i]; j++) {
+                inputIds[i].push_back(tokens[pos++]);
+            }
+        }
+        auto ret = model->ComputeScore(inputIds);
+        float *fvalue = new float[batch];
+        for (int i = 0; i < batch; i++) {
+            fvalue[i] = ret[i];
+        }
+        return fvalue;
     }
 };

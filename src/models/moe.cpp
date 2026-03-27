@@ -33,6 +33,13 @@ namespace fastllm {
         rotary_dim = 128;
 
         weight.embeddingNames.insert("model.embed_tokens.weight");
+        weight.linearNames = {
+            "lm_head.weight", "model.layers.*.down_proj.weight", "model.layers.*.up_proj.weight",
+            "model.layers.*.gate_proj.weight",  "model.layers.*.gate_proj.weight", "model.layers.*.gateup_proj.weight",
+            "model.layers.*.self_attn.o_proj.weight", "model.layers.*.self_attn.q_proj.weight", "model.layers.*.self_attn.k_proj.weight",
+            "model.layers.*.self_attn.v_proj.weight", "model.layers.*.self_attn.mergeqkv.weight", "model.layers.*.self_attn.W_pack.weight",
+            "model.layers.*.mlp.*.weight"
+        };
     }
 
     void MoeModel::InitParams() {
@@ -304,8 +311,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
             }
             int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
             if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
@@ -622,8 +629,8 @@ namespace fastllm {
                     pastKey.lockInCPU = true;
                     pastValue.lockInCPU = true;
                 } else {
-                    pastKey.ToDevice(DataDevice::CUDA);
-                    pastValue.ToDevice(DataDevice::CUDA);
+                    pastKey.ToDevice(k.dataDevice);
+                    pastValue.ToDevice(k.dataDevice);
                 }
                 int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b];
                 if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
@@ -857,16 +864,19 @@ namespace fastllm {
         this->num_experts_per_tok = this->num_experts;
 
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
-        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
-        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0, 0});
+        Data attentionMask = Data(this->dataType, {1, 1}, {0});
+        Data positionIds = Data(this->dataType, {1, 1}, {0, 0});
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
+                                                   Data(this->dataType)));
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         this->num_experts_per_tok = oldTopk;
+        elementsInKVCachePerToken = (long long)block_cnt * 
+            (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
+             pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
         printf("finish.\n");
     }
 }

@@ -38,6 +38,11 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        std::vector <int> ForwardBatchV2(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits);
 
         std::vector <int> ForwardBatch(
                 int batch,
@@ -49,6 +54,9 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        // 是否需要生成AttentionMask
+        virtual bool NeedAttentionMask(int qlen, int klen);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
@@ -62,7 +70,6 @@ namespace fastllm {
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
-
     protected:
         RoPEType rope_type = RoPEType::BASE;
 
@@ -73,11 +80,6 @@ namespace fastllm {
         int num_key_value_heads = num_attention_heads;
 
         float rms_norm_eps = 1e-6;
-
-        float routed_scaling_factor;
-        int num_experts_per_tok;
-        int num_experts;
-        bool norm_topk_prob;
 
         int max_position_embeddings;
         int rope_theta;
